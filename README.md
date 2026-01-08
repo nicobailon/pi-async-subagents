@@ -1,16 +1,156 @@
 # pi-async-subagents
 
-Pi extension for delegating tasks to subagents with async support, output truncation, debug artifacts, progress tracking, and optional session sharing.
+Pi extension for delegating tasks to subagents with SDK-based execution, agent-scoped extensions/skills/context, async support, output truncation, debug artifacts, and progress tracking.
 
-## Features (beyond base)
+## Features
 
+- **SDK-Based Execution**: Runs agents via `createAgentSession()` instead of subprocess - faster, better integration
+- **Agent-Scoped Extensions**: Load extensions only for specific agents via frontmatter
+- **Agent-Scoped Skills**: Inject skills only for specific agents
+- **Agent-Scoped Context**: Provide AGENTS.md-style context files per agent
 - **Live Progress Display**: Real-time visibility during sync execution showing current tool, recent output, tokens, and duration
 - **Output Truncation**: Configurable byte/line limits via `maxOutput`
-- **Debug Artifacts**: Input/output/JSONL/metadata files per task
-- **Session Logs**: JSONL + optional HTML export; share link via GitHub Gist
+- **Debug Artifacts**: Input/output/metadata files per task
 - **Async Status Files**: Durable `status.json`, `events.jsonl`, and markdown logs for async runs
 - **Async Widget**: Lightweight TUI widget shows background run progress
-- **Session-scoped Notifications**: Async completions only notify the originating session
+
+## Agent Frontmatter Reference
+
+Define agents in markdown files at `~/.pi/agent/agents/` (user scope) or `.pi/agents/` (project scope):
+
+```markdown
+---
+name: my-agent
+description: Short description for agent listing
+model: claude-sonnet-4-20250514
+tools: read, bash, grep, find, ls
+extensions: ./hooks/enforce-json.ts, ./hooks/block-writes.ts
+skills: ./skills/security-checklist
+contextFiles: ./REVIEW_GUIDELINES.md
+---
+
+Your agent's system prompt goes here...
+```
+
+### Frontmatter Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | **Required.** Agent identifier |
+| `description` | string | **Required.** Short description shown in agent listings |
+| `model` | string | Model to use (e.g., `claude-sonnet-4-20250514`). Default: parent's model |
+| `tools` | string | Comma-separated list of tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` |
+| `extensions` | string | **NEW.** Comma-separated paths to extension files (agent-scoped) |
+| `skills` | string | **NEW.** Comma-separated paths to skill directories (agent-scoped) |
+| `contextFiles` | string | **NEW.** Comma-separated paths to context files like AGENTS.md (agent-scoped) |
+
+### Path Resolution
+
+Paths in `extensions`, `skills`, and `contextFiles` are resolved relative to the agent file's directory:
+
+```
+~/.pi/agent/agents/
+├── code-reviewer.md        # Agent definition
+├── hooks/
+│   ├── enforce-json.ts     # Referenced as ./hooks/enforce-json.ts
+│   └── block-writes.ts
+├── skills/
+│   └── security-checklist/
+│       └── SKILL.md
+└── REVIEW_GUIDELINES.md    # Referenced as ./REVIEW_GUIDELINES.md
+```
+
+### Bundled Example Hooks
+
+This extension includes example hooks you can use directly or copy:
+
+```
+~/.pi/agent/extensions/subagent/hooks/
+├── enforce-json.ts         # Validates output is valid JSON, retries if not
+└── read-only-bash.ts       # Blocks write commands in bash
+```
+
+Reference them from your agents using absolute paths:
+```yaml
+extensions: ~/.pi/agent/extensions/subagent/hooks/read-only-bash.ts
+```
+
+## Agent-Scoped Extensions
+
+When an agent specifies `extensions`, only those extensions are loaded for that agent. Global extensions from `~/.pi/agent/extensions/` are NOT loaded.
+
+### Example: JSON Output Enforcement
+
+```markdown
+---
+name: reviewer
+description: Code review specialist that outputs JSON
+tools: read, grep, find, ls
+extensions: ./hooks/enforce-json.ts
+---
+
+You are a code reviewer. Output your review in valid JSON format...
+```
+
+`hooks/enforce-json.ts`:
+```typescript
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+
+export default function(pi: ExtensionAPI) {
+  pi.on("agent_end", async (event, ctx) => {
+    const lastMsg = event.messages?.filter(m => m.role === "assistant").pop();
+    if (!lastMsg) return;
+    
+    const text = lastMsg.content
+      .filter(c => c.type === "text")
+      .map(c => c.text)
+      .join("\n")
+      .trim();
+    
+    try {
+      JSON.parse(text);
+    } catch {
+      // Trigger retry for invalid JSON
+      pi.sendMessage({
+        customType: "json-retry",
+        content: "Output is not valid JSON. Please output ONLY valid JSON, no prose.",
+        display: true,
+      }, { triggerTurn: true });
+    }
+  });
+}
+```
+
+### Example: Read-Only Bash
+
+```markdown
+---
+name: scout
+description: Codebase exploration agent
+tools: read, bash, grep, find, ls
+extensions: ./hooks/read-only-bash.ts
+---
+
+You explore codebases to gather context...
+```
+
+`hooks/read-only-bash.ts`:
+```typescript
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+
+export default function(pi: ExtensionAPI) {
+  pi.on("tool_call", async (event) => {
+    if (event.toolName !== "bash") return;
+    
+    const cmd = event.input.command as string;
+    const writePatterns = /\b(rm|mv|cp|mkdir|touch|chmod|chown|>|>>|tee|sed -i|git commit|git push)\b/;
+    
+    if (writePatterns.test(cmd)) {
+      return { block: true, reason: "This agent is read-only. Write commands are blocked." };
+    }
+  });
+}
+```
 
 ## Modes
 
@@ -24,12 +164,10 @@ Pi extension for delegating tasks to subagents with async support, output trunca
 
 **subagent tool:**
 ```typescript
-{ agent: "worker", task: "refactor auth", async: false }
+{ agent: "worker", task: "refactor auth" }
 { agent: "scout", task: "find todos", maxOutput: { lines: 1000 } }
 { tasks: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b" }] }
 { chain: [{ agent: "scout", task: "find" }, { agent: "worker", task: "fix {previous}" }] }
-{ agent: "scout", task: "investigate", share: true }
-{ agent: "scout", task: "investigate", share: false, sessionDir: "/path/to/keep" }
 ```
 
 **subagent_status tool:**
@@ -45,21 +183,15 @@ Pi extension for delegating tasks to subagents with async support, output trunca
 | `agent` | string | - | Agent name (single mode) |
 | `task` | string | - | Task string (single mode) |
 | `tasks` | `{agent, task, cwd?}[]` | - | Parallel tasks (sync only) |
-| `chain` | `{agent, task, cwd?}[]` | - | Sequential steps (single/async supported); use `{previous}` |
+| `chain` | `{agent, task, cwd?}[]` | - | Sequential steps; use `{previous}` |
 | `agentScope` | `"user" \| "project" \| "both"` | `user` | Agent discovery scope |
-| `async` | boolean | true | Background execution (single/chain only) |
+| `async` | boolean | false | Background execution (single/chain only) |
 | `cwd` | string | - | Override working directory |
-| `maxOutput` | `{bytes?, lines?}` | 200KB, 5000 lines | Truncation limits for final output |
+| `maxOutput` | `{bytes?, lines?}` | 200KB, 5000 lines | Truncation limits |
 | `artifacts` | boolean | true | Write debug artifacts |
 | `includeProgress` | boolean | false | Include full progress in result |
-| `share` | boolean | true | Create shareable session log (requires `gh`) |
-| `sessionDir` | string | temp | Directory to store session logs (enables sessions even if `share=false`) |
-
-Status tool:
-
-| Tool | Description |
-|------|-------------|
-| `subagent_status` | Inspect async run status by id or dir |
+| `share` | boolean | false | Create shareable session (async mode only) |
+| `sessionDir` | string | temp | Directory to store session logs |
 
 ## Artifacts
 
@@ -68,16 +200,9 @@ Location: `{sessionDir}/subagent-artifacts/` or `/tmp/pi-subagent-artifacts/`
 Files per task:
 - `{runId}_{agent}_input.md` - Task prompt
 - `{runId}_{agent}_output.md` - Full output (untruncated)
-- `{runId}_{agent}.jsonl` - Event stream (sync only)
 - `{runId}_{agent}_meta.json` - Timing, usage, exit code
 
-## Session logs + share links
-
-Session files are stored under a per-run session dir (temp by default). If `share=true` and `gh` is logged in,
-the tool exports HTML and creates a private gist, then reports a share URL. Set `sessionDir` to keep session
-logs outside `/tmp`.
-
-## Live progress (sync mode)
+## Live Progress (Sync Mode)
 
 During sync execution, the collapsed view shows:
 - Current step (for chains): `... chain 2/3 | 8 tools, 1.4k tok, 38s`
@@ -87,42 +212,40 @@ During sync execution, the collapsed view shows:
 
 Press **Ctrl+O** to expand the full streaming view with complete output.
 
-## Async observability
+## SDK-Based Execution
 
-Async runs write a dedicated observability folder:
+The subagent tool uses the Pi SDK (`createAgentSession()`) directly instead of spawning subprocess. This provides:
 
-```
-/tmp/pi-async-subagent-runs/<id>/
-  status.json
-  events.jsonl
-  subagent-log-<id>.md
-```
+1. **Faster execution**: No process spawn overhead (~500ms saved per agent)
+2. **Agent-scoped configuration**: Extensions, skills, and context files only load for the specific agent
+3. **Better integration**: Direct access to session events without JSON parsing
+4. **Shared model registry**: API keys and model configuration from parent process
 
-`status.json` is the source of truth for async progress and powers the TUI widget. If you already use
-`/status <id>` you can keep doing that; otherwise use:
+### Migration Notes
 
-```typescript
-subagent_status({ id: "<id>" })
-subagent_status({ dir: "/tmp/pi-async-subagent-runs/<id>" })
-```
+**Backwards Compatible**: Existing agents without `extensions`, `skills`, or `contextFiles` work unchanged.
+
+**Session Sharing**: Session sharing (`share: true`) is only supported in async mode. Sync mode uses in-memory sessions for performance.
 
 ## Events
 
-Async events:
-- `subagent:started`
-- `subagent:complete`
-
-Legacy events (still emitted):
-- `subagent_enhanced:started`
-- `subagent_enhanced:complete`
+Emitted events:
+- `subagent:started` - When async run starts
+- `subagent:complete` - When async run completes
 
 ## Files
 
 ```
-├── index.ts           # Main extension (registerTool)
+├── index.ts           # Main extension (subagent + subagent_status tools)
+├── sdk-runner.ts      # SDK-based agent execution
+├── tool-resolver.ts   # Tool name → tool instance resolution
+├── loaders.ts         # Skills and context file loaders
 ├── notify.ts          # Async completion notifications
-├── subagent-runner.ts # Async runner
-├── agents.ts          # Agent discovery
+├── subagent-runner.ts # Async subprocess runner (for async mode)
+├── agents.ts          # Agent discovery and config parsing
 ├── artifacts.ts       # Artifact management
-└── types.ts           # Shared types
+├── types.ts           # Shared types
+└── hooks/             # Example agent-scoped extensions
+    ├── enforce-json.ts    # JSON output validation with retry
+    └── read-only-bash.ts  # Block write commands in bash
 ```

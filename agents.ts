@@ -13,6 +13,9 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	extensions?: string[];      // Paths to extension files (agent-scoped)
+	skills?: string[];          // Paths to skill directories (agent-scoped)
+	contextFiles?: string[];    // Paths to context files like AGENTS.md (agent-scoped)
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -53,6 +56,37 @@ function parseFrontmatter(content: string): { frontmatter: Record<string, string
 	return { frontmatter, body };
 }
 
+/**
+ * Expand ~ to home directory in a path.
+ */
+function expandTilde(p: string): string {
+	if (p.startsWith("~/")) {
+		return path.join(os.homedir(), p.slice(2));
+	}
+	if (p === "~") {
+		return os.homedir();
+	}
+	return p;
+}
+
+function parseCommaSeparatedPaths(value: string | undefined, basePath: string): string[] | undefined {
+	if (!value) return undefined;
+	const paths = value
+		.split(",")
+		.map((p) => p.trim())
+		.filter(Boolean)
+		.map((p) => {
+			// Expand ~ to home directory
+			const expanded = expandTilde(p);
+			// Resolve relative paths against the agent file's directory
+			if (expanded.startsWith("./") || expanded.startsWith("../") || !path.isAbsolute(expanded)) {
+				return path.resolve(basePath, expanded);
+			}
+			return expanded;
+		});
+	return paths.length > 0 ? paths : undefined;
+}
+
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
@@ -85,16 +119,39 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
+		const agentDir = path.dirname(filePath);
+
+		// Parse tools - resolve any paths (e.g., ./custom-tool.ts) relative to agent dir
 		const tools = frontmatter.tools
 			?.split(",")
 			.map((t) => t.trim())
-			.filter(Boolean);
+			.filter(Boolean)
+			.map((t) => {
+				// If it looks like a path (contains / or ends with .ts/.js), resolve it
+				if (t.includes("/") || t.endsWith(".ts") || t.endsWith(".js")) {
+					// Expand ~ to home directory
+					const expanded = expandTilde(t);
+					if (!path.isAbsolute(expanded)) {
+						return path.resolve(agentDir, expanded);
+					}
+					return expanded;
+				}
+				return t;
+			});
+
+		// Parse new agent-scoped fields with path resolution
+		const extensions = parseCommaSeparatedPaths(frontmatter.extensions, agentDir);
+		const skills = parseCommaSeparatedPaths(frontmatter.skills, agentDir);
+		const contextFiles = parseCommaSeparatedPaths(frontmatter.contextFiles || frontmatter["context-files"], agentDir);
 
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
+			extensions,
+			skills,
+			contextFiles,
 			systemPrompt: body,
 			source,
 			filePath,

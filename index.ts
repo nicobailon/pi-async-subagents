@@ -22,7 +22,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { type ExtensionAPI, type ExtensionContext, type ToolDefinition, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
+import {
+	type AuthStorage,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ModelRegistry,
+	type ToolDefinition,
+	getMarkdownTheme,
+} from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
@@ -35,6 +42,7 @@ import {
 	writeArtifact,
 	writeMetadata,
 } from "./artifacts.js";
+import { runAgentSDK } from "./sdk-runner.js";
 import {
 	type AgentProgress,
 	type ArtifactConfig,
@@ -478,6 +486,9 @@ interface RunSyncOptions {
 	index?: number;
 	sessionDir?: string;
 	share?: boolean;
+	// SDK dependencies (required for SDK-based execution)
+	authStorage: AuthStorage;
+	modelRegistry: ModelRegistry;
 }
 
 async function runSync(
@@ -487,7 +498,7 @@ async function runSync(
 	task: string,
 	options: RunSyncOptions,
 ): Promise<SingleResult> {
-	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index } = options;
+	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, authStorage, modelRegistry } = options;
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		return {
@@ -499,45 +510,6 @@ async function runSync(
 			error: `Unknown agent: ${agentName}`,
 		};
 	}
-
-	const args = ["--mode", "json", "-p"];
-	const shareEnabled = options.share === true;
-	const sessionEnabled = Boolean(options.sessionDir) || shareEnabled;
-	if (!sessionEnabled) {
-		args.push("--no-session");
-	}
-	if (options.sessionDir) {
-		try {
-			fs.mkdirSync(options.sessionDir, { recursive: true });
-		} catch {}
-		args.push("--session-dir", options.sessionDir);
-	}
-	if (agent.model) args.push("--model", agent.model);
-	if (agent.tools?.length) {
-		const builtinTools: string[] = [];
-		const extensionPaths: string[] = [];
-		for (const tool of agent.tools) {
-			if (tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")) {
-				extensionPaths.push(tool);
-			} else {
-				builtinTools.push(tool);
-			}
-		}
-		if (builtinTools.length > 0) {
-			args.push("--tools", builtinTools.join(","));
-		}
-		for (const extPath of extensionPaths) {
-			args.push("--extension", extPath);
-		}
-	}
-
-	let tmpDir: string | null = null;
-	if (agent.systemPrompt?.trim()) {
-		const tmp = writePrompt(agent.name, agent.systemPrompt);
-		tmpDir = tmp.dir;
-		args.push("--append-system-prompt", tmp.path);
-	}
-	args.push(`Task: ${task}`);
 
 	const result: SingleResult = {
 		agent: agentName,
@@ -561,8 +533,8 @@ async function runSync(
 	result.progress = progress;
 
 	const startTime = Date.now();
-	const jsonlLines: string[] = [];
 
+	// Setup artifacts
 	let artifactPathsResult: ArtifactPaths | undefined;
 	if (artifactsDir && artifactConfig?.enabled !== false) {
 		artifactPathsResult = getArtifactPaths(artifactsDir, runId, agentName, index);
@@ -572,138 +544,86 @@ async function runSync(
 		}
 	}
 
-	const exitCode = await new Promise<number>((resolve) => {
-		const proc = spawn("pi", args, { cwd: cwd ?? runtimeCwd, stdio: ["ignore", "pipe", "pipe"] });
-		let buf = "";
-
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			jsonlLines.push(line);
-			try {
-				const evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; args?: unknown };
-				const now = Date.now();
-				progress.durationMs = now - startTime;
-
-				if (evt.type === "tool_execution_start") {
-					progress.toolCount++;
-					progress.currentTool = evt.toolName;
-					progress.currentToolArgs = extractToolArgsPreview((evt.args || {}) as Record<string, unknown>);
-					if (onUpdate)
-						onUpdate({
-							content: [{ type: "text", text: getFinalOutput(result.messages) || "(running...)" }],
-							details: { mode: "single", results: [result], progress: [progress] },
-						});
-				}
-
-				if (evt.type === "tool_execution_end") {
-					if (progress.currentTool) {
-						progress.recentTools.unshift({
-							tool: progress.currentTool,
-							args: progress.currentToolArgs || "",
-							endMs: now,
-						});
-						if (progress.recentTools.length > 5) {
-							progress.recentTools.pop();
-						}
-					}
-					progress.currentTool = undefined;
-					progress.currentToolArgs = undefined;
-					if (onUpdate)
-						onUpdate({
-							content: [{ type: "text", text: getFinalOutput(result.messages) || "(running...)" }],
-							details: { mode: "single", results: [result], progress: [progress] },
-						});
-				}
-
-				if (evt.type === "message_end" && evt.message) {
-					result.messages.push(evt.message);
-					if (evt.message.role === "assistant") {
-						result.usage.turns++;
-						const u = evt.message.usage;
-						if (u) {
-							result.usage.input += u.input || 0;
-							result.usage.output += u.output || 0;
-							result.usage.cacheRead += u.cacheRead || 0;
-							result.usage.cacheWrite += u.cacheWrite || 0;
-							result.usage.cost += u.cost?.total || 0;
-							progress.tokens = result.usage.input + result.usage.output;
-						}
-						if (!result.model && evt.message.model) result.model = evt.message.model;
-						if (evt.message.errorMessage) result.error = evt.message.errorMessage;
-
-						const text = extractTextFromContent(evt.message.content);
-						if (text) {
-							const lines = text
-								.split("\n")
-								.filter((l) => l.trim())
-								.slice(-8);
-							progress.recentOutput = lines;
-						}
-					}
-					if (onUpdate)
-						onUpdate({
-							content: [{ type: "text", text: getFinalOutput(result.messages) || "(running...)" }],
-							details: { mode: "single", results: [result], progress: [progress] },
-						});
-				}
-				if (evt.type === "tool_result_end" && evt.message) {
-					result.messages.push(evt.message);
-					if (onUpdate)
-						onUpdate({
-							content: [{ type: "text", text: getFinalOutput(result.messages) || "(running...)" }],
-							details: { mode: "single", results: [result], progress: [progress] },
-						});
-				}
-			} catch {}
-		};
-
-		let stderrBuf = "";
-		let lastUpdateTime = 0;
-		const UPDATE_THROTTLE_MS = 150;
-
-		proc.stdout.on("data", (d) => {
-			buf += d.toString();
-			const lines = buf.split("\n");
-			buf = lines.pop() || "";
-			lines.forEach(processLine);
-
-			// Throttled periodic update for smoother progress display
+	// Run via SDK
+	const sdkResult = await runAgentSDK({
+		agent,
+		task,
+		cwd: cwd ?? runtimeCwd,
+		authStorage,
+		modelRegistry,
+		signal,
+		onProgress: (sdkProgress) => {
 			const now = Date.now();
-			if (onUpdate && now - lastUpdateTime > UPDATE_THROTTLE_MS) {
-				lastUpdateTime = now;
-				progress.durationMs = now - startTime;
+			progress.durationMs = now - startTime;
+			progress.toolCount = sdkProgress.toolCount;
+			progress.tokens = sdkProgress.tokens;
+
+			// Track tool start/end for recentTools
+			if (sdkProgress.currentTool) {
+				// Tool started - add to recent tools if not already there
+				progress.currentTool = sdkProgress.currentTool;
+				progress.currentToolArgs = sdkProgress.currentToolArgs;
+				
+				if (!progress.recentTools.find((t) => t.tool === sdkProgress.currentTool && t.endMs === 0)) {
+					progress.recentTools.unshift({
+						tool: sdkProgress.currentTool,
+						args: sdkProgress.currentToolArgs || "",
+						endMs: 0,
+					});
+					if (progress.recentTools.length > 5) {
+						progress.recentTools.pop();
+					}
+				}
+			} else if (progress.currentTool) {
+				// Tool ended - update endMs for the current tool
+				const currentToolEntry = progress.recentTools.find((t) => t.tool === progress.currentTool && t.endMs === 0);
+				if (currentToolEntry) {
+					currentToolEntry.endMs = now;
+				}
+				progress.currentTool = undefined;
+				progress.currentToolArgs = undefined;
+			}
+
+			if (onUpdate) {
 				onUpdate({
 					content: [{ type: "text", text: getFinalOutput(result.messages) || "(running...)" }],
 					details: { mode: "single", results: [result], progress: [progress] },
 				});
 			}
-		});
-		proc.stderr.on("data", (d) => {
-			stderrBuf += d.toString();
-		});
-		proc.on("close", (code) => {
-			if (buf.trim()) processLine(buf);
-			if (code !== 0 && stderrBuf.trim() && !result.error) {
-				result.error = stderrBuf.trim();
-			}
-			resolve(code ?? 0);
-		});
-		proc.on("error", () => resolve(1));
+		},
+		onMessage: (message) => {
+			result.messages.push(message);
 
-		if (signal) {
-			const kill = () => {
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
-			};
-			if (signal.aborted) kill();
-			else signal.addEventListener("abort", kill, { once: true });
-		}
+			// Update recent output from assistant messages
+			if (message.role === "assistant") {
+				const text = extractTextFromContent(message.content);
+				if (text) {
+					const lines = text
+						.split("\n")
+						.filter((l) => l.trim())
+						.slice(-8);
+					progress.recentOutput = lines;
+				}
+			}
+
+			if (onUpdate) {
+				onUpdate({
+					content: [{ type: "text", text: getFinalOutput(result.messages) || "(running...)" }],
+					details: { mode: "single", results: [result], progress: [progress] },
+				});
+			}
+		},
 	});
 
-	if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
-	result.exitCode = exitCode;
+	// Map SDK result to SingleResult
+	result.messages = sdkResult.messages;
+	result.usage = sdkResult.usage;
+	result.model = sdkResult.model;
+	result.exitCode = sdkResult.exitCode;
+	result.error = sdkResult.error;
 
-	if (exitCode === 0 && !result.error) {
+	// Check for tool errors in messages
+	if (result.exitCode === 0 && !result.error) {
 		const errInfo = detectSubagentError(result.messages);
 		if (errInfo.hasError) {
 			result.exitCode = errInfo.exitCode ?? 1;
@@ -713,8 +633,11 @@ async function runSync(
 		}
 	}
 
+	// Finalize progress
 	progress.status = result.exitCode === 0 ? "completed" : "failed";
 	progress.durationMs = Date.now() - startTime;
+	// toolCount is already tracked via onProgress callbacks, don't reset it
+	progress.tokens = sdkResult.usage.input + sdkResult.usage.output;
 	if (result.error) {
 		progress.error = result.error;
 		if (progress.currentTool) {
@@ -729,17 +652,13 @@ async function runSync(
 		durationMs: progress.durationMs,
 	};
 
+	// Handle artifacts
 	if (artifactPathsResult && artifactConfig?.enabled !== false) {
 		result.artifactPaths = artifactPathsResult;
 		const fullOutput = getFinalOutput(result.messages);
 
 		if (artifactConfig?.includeOutput !== false) {
 			writeArtifact(artifactPathsResult.outputPath, fullOutput);
-		}
-		if (artifactConfig?.includeJsonl !== false) {
-			for (const line of jsonlLines) {
-				appendJsonl(artifactPathsResult.jsonlPath, line);
-			}
 		}
 		if (artifactConfig?.includeMetadata !== false) {
 			writeMetadata(artifactPathsResult.metadataPath, {
@@ -772,25 +691,10 @@ async function runSync(
 		}
 	}
 
-	if (shareEnabled && options.sessionDir) {
-		const sessionFile = findLatestSessionFile(options.sessionDir);
-		if (sessionFile) {
-			result.sessionFile = sessionFile;
-			try {
-				const htmlPath = await exportSessionHtml(sessionFile, options.sessionDir);
-				const share = createShareLink(htmlPath);
-				if ("error" in share) {
-					result.shareError = share.error;
-				} else {
-					result.shareUrl = share.shareUrl;
-					result.gistUrl = share.gistUrl;
-				}
-			} catch (err) {
-				result.shareError = String(err);
-			}
-		} else {
-			result.shareError = "Session file not found.";
-		}
+	// Note: Session sharing is not supported with SDK mode (uses in-memory sessions)
+	// If session sharing is needed, the async subprocess runner can still be used
+	if (options.share === true) {
+		result.shareError = "Session sharing not supported with SDK mode. Use async mode for session sharing.";
 	}
 
 	return result;
@@ -946,6 +850,10 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			baseCwd = ctx.cwd;
 			currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 			const agents = discoverAgents(ctx.cwd, scope).agents;
+
+			// Extract SDK dependencies from context for SDK-based execution
+			const { modelRegistry } = ctx;
+			const authStorage = modelRegistry.authStorage;
 			const runId = randomUUID().slice(0, 8);
 			const shareEnabled = params.share !== false;
 			const sessionEnabled = shareEnabled || Boolean(params.sessionDir);
@@ -1152,6 +1060,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						share: shareEnabled,
 						artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
 						artifactConfig,
+						authStorage,
+						modelRegistry,
 						onUpdate: onUpdate
 							? (p) =>
 									onUpdate({
@@ -1222,6 +1132,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						share: shareEnabled,
 						artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
 						artifactConfig,
+						authStorage,
+						modelRegistry,
 						maxOutput: params.maxOutput,
 					}),
 				);
@@ -1253,6 +1165,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					share: shareEnabled,
 					artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
 					artifactConfig,
+					authStorage,
+					modelRegistry,
 					maxOutput: params.maxOutput,
 					onUpdate,
 				});
