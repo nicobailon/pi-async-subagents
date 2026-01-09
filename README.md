@@ -2,6 +2,21 @@
 
 Pi extension for delegating tasks to subagents with SDK-based execution, agent-scoped extensions/skills/context, async support, output truncation, debug artifacts, and progress tracking.
 
+## 🔓 What This Unlocks
+
+**Define entire agents in markdown files.**
+
+This extension introduces a powerful agent definition system. Drop a `.md` file in `~/.pi/agent/agents/` or `.pi/agents/` and you have a reusable agent with:
+
+- **Custom system prompts** — the markdown body becomes the agent's instructions
+- **Model selection** — choose which model powers this agent
+- **Tool restrictions** — limit which tools the agent can access
+- **`extensions`** — load custom hooks per-agent: validate outputs, block dangerous commands, enforce formats, auto-retry on failure
+- **`skills`** — inject skill directories scoped to specific agents
+- **`contextFiles`** — provide AGENTS.md-style context only this agent sees
+
+Build **specialized agents with their own behaviors** — a read-only scout that blocks writes, a reviewer that enforces JSON output, a security auditor with its own guidelines — all defined in simple markdown files.
+
 ## Features
 
 - **SDK-Based Execution**: Runs agents via `createAgentSession()` instead of subprocess - faster, better integration
@@ -190,7 +205,7 @@ export default function(pi: ExtensionAPI) {
 | `maxOutput` | `{bytes?, lines?}` | 200KB, 5000 lines | Truncation limits |
 | `artifacts` | boolean | true | Write debug artifacts |
 | `includeProgress` | boolean | false | Include full progress in result |
-| `share` | boolean | false | Create shareable session (async mode only) |
+| `share` | boolean | true | Create shareable session log (async mode only) |
 | `sessionDir` | string | temp | Directory to store session logs |
 
 ## Artifacts
