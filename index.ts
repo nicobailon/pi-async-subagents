@@ -30,7 +30,7 @@ import {
 	type ToolDefinition,
 	getMarkdownTheme,
 } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
+import { Container, Markdown, matchesKey, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import {
@@ -198,8 +198,8 @@ class SubagentOverlay extends Container {
 		// Footer with controls
 		this.addChild(new Spacer(1));
 		const controls = exec.isComplete
-			? "[Enter/Esc] Close"
-			: "[Esc] Minimize | [↑/↓] Scroll";
+			? "[q/Esc/Enter] Close"
+			: "[q/Esc] Close | [↑/↓] Scroll";
 		this.addChild(new Text(controls, 1, 0));
 
 		// Error if any
@@ -210,8 +210,9 @@ class SubagentOverlay extends Container {
 	}
 
 	handleInput(data: string): void {
-		// Escape or Enter closes the overlay
-		if (data === "\x1b" || data === "\r") {
+		// Escape, Enter, or 'q' closes the overlay
+		// Use matchesKey for proper Kitty keyboard protocol support
+		if (matchesKey(data, "escape") || matchesKey(data, "enter") || matchesKey(data, "q")) {
 			this.done();
 			return;
 		}
@@ -219,11 +220,11 @@ class SubagentOverlay extends Container {
 		const totalLines = activeExecution?.allOutput.length ?? 0;
 		const maxScroll = Math.max(0, totalLines - this.maxVisibleLines);
 
-		// Arrow keys for scrolling
-		if (data === "\x1b[A") { // Up arrow - scroll up into history
+		// Arrow keys for scrolling (use matchesKey for Kitty protocol support)
+		if (matchesKey(data, "up")) {
 			this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
 			this.refresh();
-		} else if (data === "\x1b[B") { // Down arrow - scroll down toward recent
+		} else if (matchesKey(data, "down")) {
 			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
 			this.refresh();
 		}
@@ -1894,7 +1895,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				});
 
 				if (result.exitCode !== 0) {
-					ctx.ui.notify(`${agentName} failed: ${result.error || "Unknown error"}`, "error");
+					// Provide more context in error message
+					const errorDetail = result.error 
+						|| getFinalOutput(result.messages)?.slice(0, 200) 
+						|| "Unknown error";
+					ctx.ui.notify(`${agentName} failed: ${errorDetail}`, "error");
 					return;
 				}
 

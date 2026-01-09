@@ -53,6 +53,10 @@
 - Overlay: Accumulates ALL output lines for scrolling (was only keeping last 8 per message)
 - Overlay: Race condition fix - uses unique execution IDs to prevent cleanup conflicts in chains
 - Overlay: Shows scroll indicators when there's more content above/below visible area
+- Overlay: Now uses `matchesKey` for proper Kitty keyboard protocol support (fixes unresponsive escape key)
+- Overlay: Added 'q' as alternative close key
+- `/background` command: Improved error messages to show more context instead of "Unknown error"
+- Renamed `AgentProgress` to `SDKProgress` in sdk-runner.ts to avoid type confusion with types.ts
 - Async widget elapsed time now freezes when job completes instead of continuing to count up
 - Progress data now correctly linked to results during execution (was showing "ok" instead of "...")
 - Chain mode now sums step durations instead of taking max (was showing incorrect total time)

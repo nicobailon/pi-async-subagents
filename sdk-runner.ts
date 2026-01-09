@@ -20,7 +20,8 @@ import type { AgentConfig } from "./agents.js";
 import { loadContextFilesFromPaths, loadSkillsFromPaths, type ContextFile } from "./loaders.js";
 import { resolveTools } from "./tool-resolver.js";
 
-export interface AgentProgress {
+/** Progress tracking specific to SDK runner (simpler than types.ts AgentProgress) */
+export interface SDKProgress {
 	currentTool?: string;
 	currentToolArgs?: string;
 	toolCount: number;
@@ -44,7 +45,7 @@ export interface SDKRunnerOptions {
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
 	signal?: AbortSignal;
-	onProgress?: (progress: AgentProgress) => void;
+	onProgress?: (progress: SDKProgress) => void;
 	onMessage?: (message: Message) => void;
 	/**
 	 * Messages to pre-load from parent session.
@@ -84,7 +85,7 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 		turns: 0,
 	};
 
-	const progress: AgentProgress = {
+	const progress: SDKProgress = {
 		toolCount: 0,
 		tokens: 0,
 		turns: 0,
