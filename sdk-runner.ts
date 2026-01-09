@@ -5,6 +5,7 @@
  * Enables agent-scoped extensions, skills, and context files.
  */
 
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import {
 	createAgentSession,
@@ -45,6 +46,12 @@ export interface SDKRunnerOptions {
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	onMessage?: (message: Message) => void;
+	/**
+	 * Messages to pre-load from parent session.
+	 * When provided, the subagent inherits the parent's conversation context
+	 * before executing its task.
+	 */
+	inheritMessages?: AgentMessage[];
 }
 
 export interface SDKRunnerResult {
@@ -66,7 +73,7 @@ export interface SDKRunnerResult {
  * - Better integration: Direct access to session events and messages
  */
 export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerResult> {
-	const { agent, task, cwd, authStorage, modelRegistry, signal, onProgress, onMessage } = options;
+	const { agent, task, cwd, authStorage, modelRegistry, signal, onProgress, onMessage, inheritMessages } = options;
 
 	const usage: Usage = {
 		input: 0,
@@ -156,6 +163,12 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 			// In-memory settings (no file I/O)
 			settingsManager: SettingsManager.inMemory(),
 		});
+
+		// Pre-load inherited messages from parent session if provided
+		// This allows the subagent to "see" the parent's conversation context
+		if (inheritMessages && inheritMessages.length > 0) {
+			session.agent.replaceMessages(inheritMessages);
+		}
 
 		// Subscribe to events for progress tracking
 		const unsubscribe = session.subscribe((event) => {

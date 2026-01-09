@@ -19,7 +19,7 @@ import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentMessage, AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
 import {
@@ -42,7 +42,7 @@ import {
 	writeArtifact,
 	writeMetadata,
 } from "./artifacts.js";
-import { runAgentSDK } from "./sdk-runner.js";
+import { getFinalOutput, runAgentSDK } from "./sdk-runner.js";
 import {
 	type AgentProgress,
 	type ArtifactConfig,
@@ -58,6 +58,186 @@ import {
 const MAX_PARALLEL = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEMS = 8;
+
+// ============================================================================
+// Active Execution Tracking (for Ctrl+O overlay)
+// ============================================================================
+
+interface ActiveExecution {
+	id: string; // Unique ID to prevent race conditions
+	agent: string;
+	task: string;
+	mode: "single" | "chain" | "parallel";
+	chainStep?: number;
+	chainTotal?: number;
+	progress: AgentProgress;
+	allOutput: string[]; // Accumulates ALL output lines for scrolling
+	isComplete: boolean;
+	error?: string;
+	startTime: number;
+}
+
+let activeExecution: ActiveExecution | null = null;
+let overlayUpdateCallback: (() => void) | null = null;
+
+function setActiveExecution(exec: ActiveExecution | null): void {
+	activeExecution = exec;
+	overlayUpdateCallback?.();
+}
+
+function updateActiveExecution(id: string, updates: Partial<ActiveExecution>): void {
+	// Only update if the ID matches (prevents race conditions)
+	if (activeExecution && activeExecution.id === id) {
+		Object.assign(activeExecution, updates);
+		overlayUpdateCallback?.();
+	}
+}
+
+function appendOutputLines(id: string, lines: string[]): void {
+	// Only append if the ID matches
+	if (activeExecution && activeExecution.id === id) {
+		activeExecution.allOutput.push(...lines);
+		// Keep a reasonable limit to prevent memory issues
+		if (activeExecution.allOutput.length > 1000) {
+			activeExecution.allOutput = activeExecution.allOutput.slice(-1000);
+		}
+		overlayUpdateCallback?.();
+	}
+}
+
+/**
+ * Overlay component for observing subagent execution in real-time.
+ * Shows streaming output, tool calls, and progress.
+ */
+class SubagentOverlay extends Container {
+	private updateInterval: ReturnType<typeof setInterval> | null = null;
+	private done: () => void;
+	private scrollOffset = 0; // 0 = showing most recent, positive = scrolled up into history
+	private maxVisibleLines = 20;
+
+	constructor(done: () => void) {
+		super();
+		this.done = done;
+		this.refresh();
+
+		// Periodically refresh to show updated progress
+		this.updateInterval = setInterval(() => this.refresh(), 100);
+
+		// Register for updates from active execution
+		overlayUpdateCallback = () => this.refresh();
+	}
+
+	override invalidate(): void {
+		super.invalidate();
+	}
+
+	refresh(): void {
+		this.children = [];
+
+		if (!activeExecution) {
+			this.addChild(new Text("No active subagent execution.", 1, 1));
+			return;
+		}
+
+		const exec = activeExecution;
+		const elapsed = Date.now() - exec.startTime;
+		const elapsedStr = formatDuration(elapsed);
+
+		// Header
+		const modeLabel = exec.mode === "chain" && exec.chainStep !== undefined
+			? `chain ${exec.chainStep + 1}/${exec.chainTotal}`
+			: exec.mode;
+		const statusIcon = exec.isComplete
+			? (exec.error ? "✗" : "✓")
+			: "◐";
+		const header = `${statusIcon} ${exec.agent} (${modeLabel}) | ${exec.progress.toolCount} tools | ${formatTokens(exec.progress.tokens)} tok | ${elapsedStr}`;
+		this.addChild(new Text(header, 1, 0));
+		this.addChild(new Spacer(1));
+
+		// Task
+		const taskPreview = exec.task.length > 100 ? exec.task.slice(0, 97) + "..." : exec.task;
+		this.addChild(new Text(`Task: ${taskPreview}`, 1, 0));
+		this.addChild(new Spacer(1));
+
+		// Current tool (if running)
+		if (exec.progress.currentTool && !exec.isComplete) {
+			const toolInfo = exec.progress.currentToolArgs
+				? `${exec.progress.currentTool}: ${exec.progress.currentToolArgs.slice(0, 60)}${exec.progress.currentToolArgs.length > 60 ? "..." : ""}`
+				: exec.progress.currentTool;
+			this.addChild(new Text(`▶ ${toolInfo}`, 1, 0));
+			this.addChild(new Spacer(1));
+		}
+
+		// Output (scrollable area)
+		// scrollOffset=0 shows most recent, higher values scroll up into history
+		this.addChild(new Text("─── Output ───", 1, 0));
+		const totalLines = exec.allOutput.length;
+		if (totalLines > 0) {
+			// Calculate slice indices: we want to show lines ending at (totalLines - scrollOffset)
+			const endIdx = Math.max(0, totalLines - this.scrollOffset);
+			const startIdx = Math.max(0, endIdx - this.maxVisibleLines);
+			const outputLines = exec.allOutput.slice(startIdx, endIdx);
+			
+			for (const line of outputLines) {
+				this.addChild(new Text(line, 1, 0));
+			}
+			
+			// Show scroll indicator if there's more content
+			if (this.scrollOffset > 0 || startIdx > 0) {
+				const indicator = startIdx > 0 && this.scrollOffset > 0
+					? `↑ ${startIdx} more lines above | ↓ ${this.scrollOffset} more below`
+					: startIdx > 0
+						? `↑ ${startIdx} more lines above`
+						: `↓ ${this.scrollOffset} more below`;
+				this.addChild(new Text(indicator, 1, 0));
+			}
+		} else {
+			this.addChild(new Text("(waiting for output...)", 1, 0));
+		}
+
+		// Footer with controls
+		this.addChild(new Spacer(1));
+		const controls = exec.isComplete
+			? "[Enter/Esc] Close"
+			: "[Esc] Minimize | [↑/↓] Scroll";
+		this.addChild(new Text(controls, 1, 0));
+
+		// Error if any
+		if (exec.error) {
+			this.addChild(new Spacer(1));
+			this.addChild(new Text(`Error: ${exec.error}`, 1, 0));
+		}
+	}
+
+	handleInput(data: string): void {
+		// Escape or Enter closes the overlay
+		if (data === "\x1b" || data === "\r") {
+			this.done();
+			return;
+		}
+
+		const totalLines = activeExecution?.allOutput.length ?? 0;
+		const maxScroll = Math.max(0, totalLines - this.maxVisibleLines);
+
+		// Arrow keys for scrolling
+		if (data === "\x1b[A") { // Up arrow - scroll up into history
+			this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
+			this.refresh();
+		} else if (data === "\x1b[B") { // Down arrow - scroll down toward recent
+			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+			this.refresh();
+		}
+	}
+
+	dispose(): void {
+		if (this.updateInterval) {
+			clearInterval(this.updateInterval);
+			this.updateInterval = null;
+		}
+		overlayUpdateCallback = null;
+	}
+}
+
 const RESULTS_DIR = "/tmp/pi-async-subagent-results";
 const ASYNC_DIR = "/tmp/pi-async-subagent-runs";
 const WIDGET_KEY = "subagent-async";
@@ -287,18 +467,6 @@ function findByPrefix(dir: string, prefix: string, suffix?: string): string | nu
 	return path.join(dir, entries.sort()[0]);
 }
 
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
 interface ErrorInfo {
 	hasError: boolean;
 	exitCode?: number;
@@ -489,6 +657,12 @@ interface RunSyncOptions {
 	// SDK dependencies (required for SDK-based execution)
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
+	// Optional: inherit parent session context
+	inheritMessages?: AgentMessage[];
+	// For overlay tracking
+	mode?: "single" | "chain" | "parallel";
+	chainStep?: number;
+	chainTotal?: number;
 }
 
 async function runSync(
@@ -498,7 +672,7 @@ async function runSync(
 	task: string,
 	options: RunSyncOptions,
 ): Promise<SingleResult> {
-	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, authStorage, modelRegistry } = options;
+	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, authStorage, modelRegistry, inheritMessages, mode, chainStep, chainTotal } = options;
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		return {
@@ -534,6 +708,25 @@ async function runSync(
 
 	const startTime = Date.now();
 
+	// Generate unique execution ID for tracking (prevents race conditions in chains)
+	const executionId = `${runId}-${index ?? 0}-${Date.now()}`;
+
+	// Set active execution for overlay tracking (only if not parallel mode - parallel updates separately)
+	if (mode !== "parallel") {
+		setActiveExecution({
+			id: executionId,
+			agent: agentName,
+			task,
+			mode: mode ?? "single",
+			chainStep,
+			chainTotal,
+			progress,
+			allOutput: [],
+			isComplete: false,
+			startTime,
+		});
+	}
+
 	// Setup artifacts
 	let artifactPathsResult: ArtifactPaths | undefined;
 	if (artifactsDir && artifactConfig?.enabled !== false) {
@@ -552,6 +745,7 @@ async function runSync(
 		authStorage,
 		modelRegistry,
 		signal,
+		inheritMessages,
 		onProgress: (sdkProgress) => {
 			const now = Date.now();
 			progress.durationMs = now - startTime;
@@ -584,6 +778,11 @@ async function runSync(
 				progress.currentToolArgs = undefined;
 			}
 
+			// Update active execution for overlay
+			if (mode !== "parallel") {
+				updateActiveExecution(executionId, { progress });
+			}
+
 			if (onUpdate) {
 				onUpdate({
 					content: [{ type: "text", text: getFinalOutput(result.messages) || "(running...)" }],
@@ -600,9 +799,14 @@ async function runSync(
 				if (text) {
 					const lines = text
 						.split("\n")
-						.filter((l) => l.trim())
-						.slice(-8);
-					progress.recentOutput = lines;
+						.filter((l) => l.trim());
+					// Keep last 8 lines in progress for the collapsed view
+					progress.recentOutput = lines.slice(-8);
+
+					// Append ALL lines to overlay's scrollable history
+					if (mode !== "parallel") {
+						appendOutputLines(executionId, lines);
+					}
 				}
 			}
 
@@ -697,6 +901,22 @@ async function runSync(
 		result.shareError = "Session sharing not supported with SDK mode. Use async mode for session sharing.";
 	}
 
+	// Mark execution complete (for overlay) but don't clear yet - let overlay show final state
+	if (mode !== "parallel") {
+		updateActiveExecution(executionId, {
+			isComplete: true,
+			error: result.error,
+			progress,
+		});
+		// Clear after a short delay to allow overlay to show completion
+		// Use execution ID to ensure we only clear THIS execution, not a subsequent one
+		setTimeout(() => {
+			if (activeExecution?.id === executionId && activeExecution?.isComplete) {
+				setActiveExecution(null);
+			}
+		}, 100);
+	}
+
 	return result;
 }
 
@@ -744,6 +964,9 @@ const Params = Type.Object({
 	share: Type.Optional(Type.Boolean({ description: "Create shareable session log (default: true)", default: true })),
 	sessionDir: Type.Optional(
 		Type.String({ description: "Directory to store session logs (default: temp; enables sessions even if share=false)" }),
+	),
+	inheritContext: Type.Optional(
+		Type.Boolean({ description: "Inherit parent session context (subagent sees parent's conversation history)" }),
 	),
 });
 
@@ -876,7 +1099,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 			const requestedAsync = params.async ?? asyncByDefault;
 			const parallelDowngraded = hasTasks && requestedAsync;
-			const isAsync = requestedAsync && !hasTasks;
+			// inheritContext forces sync mode (subprocess can't access parent session)
+			const isAsync = requestedAsync && !hasTasks && !params.inheritContext;
 
 			const artifactConfig: ArtifactConfig = {
 				...DEFAULT_ARTIFACT_CONFIG,
@@ -1045,6 +1269,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			const allProgress: AgentProgress[] = [];
 			const allArtifactPaths: ArtifactPaths[] = [];
 
+			// Get inherited messages from parent session if requested
+			// Note: buildSessionContext() is on full SessionManager but ExtensionContext exposes ReadonlySessionManager
+			// The actual runtime object is the full SessionManager, so this works
+			const inheritMessages: AgentMessage[] | undefined = params.inheritContext
+				? (ctx.sessionManager as unknown as { buildSessionContext(): { messages: AgentMessage[] } }).buildSessionContext().messages
+				: undefined;
+
 			if (hasChain && params.chain) {
 				const results: SingleResult[] = [];
 				let prev = "";
@@ -1062,6 +1293,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						artifactConfig,
 						authStorage,
 						modelRegistry,
+						// Only first step in chain inherits parent context; subsequent steps get {previous}
+						inheritMessages: i === 0 ? inheritMessages : undefined,
+						// For overlay tracking
+						mode: "chain",
+						chainStep: i,
+						chainTotal: params.chain.length,
 						onUpdate: onUpdate
 							? (p) =>
 									onUpdate({
@@ -1135,6 +1372,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						authStorage,
 						modelRegistry,
 						maxOutput: params.maxOutput,
+						inheritMessages,
+						// Parallel mode doesn't track individual executions in overlay
+						mode: "parallel",
 					}),
 				);
 
@@ -1168,6 +1408,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					authStorage,
 					modelRegistry,
 					maxOutput: params.maxOutput,
+					inheritMessages,
+					mode: "single",
 					onUpdate,
 				});
 
@@ -1301,7 +1543,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					for (const line of r.progress.recentOutput.slice(-3)) {
 						lines.push(theme.fg("dim", `  ${line.slice(0, 80)}${line.length > 80 ? "..." : ""}`));
 					}
-					lines.push(theme.fg("dim", "(ctrl+o to expand)"));
+					lines.push(theme.fg("dim", "(ctrl+shift+o for overlay)"));
 				} else {
 					const items = getDisplayItems(r.messages).slice(-COLLAPSED_ITEMS);
 					for (const item of items) {
@@ -1421,10 +1663,10 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				for (const line of runningProgress.recentOutput.slice(-2)) {
 					lines.push(theme.fg("dim", `    ${line.slice(0, 70)}${line.length > 70 ? "..." : ""}`));
 				}
-				lines.push(theme.fg("dim", "(ctrl+o to expand)"));
+				lines.push(theme.fg("dim", "(ctrl+shift+o for overlay)"));
 			} else if (hasRunning) {
 				// Fallback: we know something is running but can't find details
-				lines.push(theme.fg("dim", "(ctrl+o to expand)"));
+				lines.push(theme.fg("dim", "(ctrl+shift+o for overlay)"));
 			}
 			return new Text(lines.join("\n"), 0, 0);
 		},
@@ -1574,6 +1816,102 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			renderWidget(ctx, Array.from(asyncJobs.values()));
 			ensurePoller();
 		}
+	});
+
+	// Register Ctrl+Shift+O shortcut to show subagent overlay during execution
+	// Note: We use Ctrl+Shift+O instead of Ctrl+O because the extension shortcut system
+	// always consumes matched keys. Using plain Ctrl+O would break the default "expand
+	// tool result" behavior when no subagent is running.
+	pi.registerShortcut("ctrl+shift+o", {
+		description: "Open subagent execution overlay",
+		async handler(ctx) {
+			if (!activeExecution) {
+				if (ctx.hasUI) {
+					ctx.ui.notify("No active subagent execution", "info");
+				}
+				return;
+			}
+			if (!ctx.hasUI) {
+				return;
+			}
+
+			// Show the overlay
+			await ctx.ui.custom(
+				(_tui, _theme, _kb, done) => new SubagentOverlay(() => done(undefined)),
+				{ overlay: true }
+			);
+		},
+	});
+
+	// Register /background slash command for quick subagent invocation with inherited context
+	pi.registerCommand("background", {
+		description: "Run a subagent with inherited session context: /background <agent> <task>",
+		async handler(args, ctx) {
+			// Parse args: first word is agent name, rest is task
+			const trimmed = args.trim();
+			if (!trimmed) {
+				ctx.ui.notify("Usage: /background <agent> <task>", "error");
+				return;
+			}
+
+			const spaceIndex = trimmed.indexOf(" ");
+			if (spaceIndex === -1) {
+				ctx.ui.notify("Usage: /background <agent> <task>", "error");
+				return;
+			}
+
+			const agentName = trimmed.slice(0, spaceIndex);
+			const task = trimmed.slice(spaceIndex + 1).trim();
+
+			if (!task) {
+				ctx.ui.notify("Usage: /background <agent> <task>", "error");
+				return;
+			}
+
+			// Discover agents
+			const agents = discoverAgents(ctx.cwd, "both").agents;
+			const agent = agents.find((a) => a.name === agentName);
+			if (!agent) {
+				const available = agents.map((a) => a.name).join(", ") || "none";
+				ctx.ui.notify(`Unknown agent: ${agentName}. Available: ${available}`, "error");
+				return;
+			}
+
+			// Get inherited messages from parent session
+			const inheritMessages = (ctx.sessionManager as unknown as { buildSessionContext(): { messages: AgentMessage[] } }).buildSessionContext().messages;
+
+			ctx.ui.notify(`Running ${agentName} with inherited context...`, "info");
+
+			try {
+				// Run the subagent with inherited context
+				const result = await runAgentSDK({
+					agent,
+					task,
+					cwd: ctx.cwd,
+					authStorage: ctx.modelRegistry.authStorage,
+					modelRegistry: ctx.modelRegistry,
+					inheritMessages,
+				});
+
+				if (result.exitCode !== 0) {
+					ctx.ui.notify(`${agentName} failed: ${result.error || "Unknown error"}`, "error");
+					return;
+				}
+
+				// Get the final output
+				const output = getFinalOutput(result.messages);
+
+				// Send the result back to the session, triggering a turn so the main agent can respond
+				pi.sendMessage({
+					customType: "background-result",
+					content: `## Background task completed: ${agentName}\n\n**Task:** ${task}\n\n**Result:**\n${output || "(no output)"}`,
+					display: true,
+				}, { triggerTurn: true });
+
+			} catch (err) {
+				ctx.ui.notify(`${agentName} error: ${err instanceof Error ? err.message : String(err)}`, "error");
+			}
+		},
 	});
 
 	pi.on("session_start", (_event, ctx) => {

@@ -23,6 +23,9 @@ Build **specialized agents with their own behaviors** — a read-only scout that
 - **Agent-Scoped Extensions**: Load extensions only for specific agents via frontmatter
 - **Agent-Scoped Skills**: Inject skills only for specific agents
 - **Agent-Scoped Context**: Provide AGENTS.md-style context files per agent
+- **Context Inheritance**: Subagents can inherit the parent session's conversation history
+- **`/background` Slash Command**: Quick invocation with inherited context
+- **Ctrl+Shift+O Overlay**: Expand any sync subagent execution to full-screen interactive view
 - **Live Progress Display**: Real-time visibility during sync execution showing current tool, recent output, tokens, and duration
 - **Output Truncation**: Configurable byte/line limits via `maxOutput`
 - **Debug Artifacts**: Input/output/metadata files per task
@@ -207,6 +210,48 @@ export default function(pi: ExtensionAPI) {
 | `includeProgress` | boolean | false | Include full progress in result |
 | `share` | boolean | true | Create shareable session log (async mode only) |
 | `sessionDir` | string | temp | Directory to store session logs |
+| `inheritContext` | boolean | false | Inherit parent session's conversation context |
+
+## Context Inheritance
+
+When `inheritContext: true`, the subagent receives the parent session's full conversation history before executing its task. This allows subagents to "see" what the user has been discussing and make decisions based on that context.
+
+**Use cases:**
+- Background research that needs to understand the current conversation topic
+- Parallel workers that need shared context about the project state
+- Specialist agents that need to understand prior decisions
+
+**Example:**
+```typescript
+// Subagent inherits the full conversation and can reference prior discussion
+{ agent: "researcher", task: "find relevant docs for what we discussed", inheritContext: true }
+```
+
+**Chain behavior:** For chains, only the **first step** inherits parent context. Subsequent steps receive their context via the `{previous}` placeholder from the prior step.
+
+**Note:** Context inheritance requires sync mode. If `async: true` is also specified, it auto-downgrades to sync (the subprocess runner doesn't have access to parent session state).
+
+## `/background` Slash Command
+
+Quick way to run a subagent with inherited context directly from the chat:
+
+```
+/background <agent> <task>
+```
+
+**Examples:**
+```
+/background scout find all TODO comments in this codebase
+/background researcher look up the API we discussed earlier
+/background worker implement the changes we talked about
+```
+
+The command:
+1. Inherits the full parent session context (the subagent sees your conversation history)
+2. Runs synchronously (you see the result immediately)
+3. Injects the result back into the session, triggering the main agent to respond
+
+This is equivalent to calling the subagent tool with `inheritContext: true`, but faster to type.
 
 ## Artifacts
 
@@ -223,9 +268,28 @@ During sync execution, the collapsed view shows:
 - Current step (for chains): `... chain 2/3 | 8 tools, 1.4k tok, 38s`
 - Current agent and tool: `scout: > read: packages/tui/src/...`
 - Recent output lines (last 2-3 lines)
-- Hint: `(ctrl+o to expand)`
+- Hint: `(ctrl+shift+o for overlay)`
 
-Press **Ctrl+O** to expand the full streaming view with complete output.
+Press **Ctrl+Shift+O** to expand the full streaming view with complete output.
+
+## Interactive Overlay (Ctrl+Shift+O)
+
+During any sync subagent execution, press **Ctrl+Shift+O** to open a full-screen interactive overlay:
+
+**What it shows:**
+- Agent name, task, and execution mode (single/chain step N/M)
+- Real-time progress: tool count, tokens, elapsed time
+- Current tool being executed with arguments
+- Streaming output as it's generated
+- Completion status (success/error)
+
+**Controls:**
+- **↑/↓** - Scroll through output history
+- **Esc** or **Enter** - Close overlay and return to collapsed view
+
+The overlay updates in real-time as the subagent executes. Even after completion, you can view the final state before dismissing.
+
+**Note:** Parallel mode runs multiple subagents concurrently, so the overlay is not available (no single execution to track).
 
 ## SDK-Based Execution
 

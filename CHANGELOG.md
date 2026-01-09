@@ -3,6 +3,20 @@
 ## [Unreleased]
 
 ### Added
+- **Context inheritance**: New `inheritContext` parameter allows subagents to inherit the parent session's conversation history
+  - Subagent sees all prior messages from the parent session before executing its task
+  - For chains, only the first step inherits context (subsequent steps use `{previous}`)
+  - Auto-downgrades to sync mode if `async: true` is also specified (similar to parallel mode)
+- **`/background` slash command**: Quick invocation with inherited context
+  - Usage: `/background <agent> <task>`
+  - Automatically inherits parent session context
+  - Result is injected back into session, triggering main agent to respond
+- **Ctrl+Shift+O interactive overlay**: Full-screen view during sync subagent execution
+  - Shows real-time progress: agent, task, tools, tokens, elapsed time
+  - Streams output as it's generated
+  - Scrollable output history with ↑/↓ keys
+  - Works for single and chain modes (not parallel)
+  - Uses Ctrl+Shift+O to avoid conflicting with default Ctrl+O (expand tool result)
 - **SDK-based execution**: Sync mode now uses `createAgentSession()` directly instead of spawning subprocesses
 - **Agent-scoped extensions**: New `extensions` frontmatter field to load extensions only for specific agents
 - **Agent-scoped skills**: New `skills` frontmatter field to inject skills only for specific agents
@@ -32,6 +46,13 @@
 - Tools passed via agent config can include extension paths (forwarded via `--extension`)
 
 ### Fixed
+- Removed duplicate `getFinalOutput` function (now imported from sdk-runner.ts)
+- Added proper type assertion for `buildSessionContext()` call on ReadonlySessionManager
+- Overlay: Added missing `invalidate()` method required by Component interface
+- Overlay: Fixed scroll logic - now correctly scrolls through output history with ↑/↓ keys
+- Overlay: Accumulates ALL output lines for scrolling (was only keeping last 8 per message)
+- Overlay: Race condition fix - uses unique execution IDs to prevent cleanup conflicts in chains
+- Overlay: Shows scroll indicators when there's more content above/below visible area
 - Async widget elapsed time now freezes when job completes instead of continuing to count up
 - Progress data now correctly linked to results during execution (was showing "ok" instead of "...")
 - Chain mode now sums step durations instead of taking max (was showing incorrect total time)
