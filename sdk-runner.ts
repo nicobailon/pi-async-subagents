@@ -143,6 +143,8 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 			authStorage,
 			modelRegistry,
 			model,
+			// Use agent's thinking level if specified
+			thinkingLevel: agent.thinking,
 			// Use agent's system prompt
 			systemPrompt: agent.systemPrompt?.trim() || undefined,
 			// Use resolved tools

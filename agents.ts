@@ -8,11 +8,14 @@ import * as path from "node:path";
 
 export type AgentScope = "user" | "project" | "both";
 
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
 export interface AgentConfig {
 	name: string;
 	description: string;
 	tools?: string[];
 	model?: string;
+	thinking?: ThinkingLevel;   // Extended thinking level
 	extensions?: string[];      // Paths to extension files (agent-scoped)
 	skills?: string[];          // Paths to skill directories (agent-scoped)
 	contextFiles?: string[];    // Paths to context files like AGENTS.md (agent-scoped)
@@ -144,11 +147,19 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 		const skills = parseCommaSeparatedPaths(frontmatter.skills, agentDir);
 		const contextFiles = parseCommaSeparatedPaths(frontmatter.contextFiles || frontmatter["context-files"], agentDir);
 
+		// Parse thinking level (case-insensitive)
+		const validThinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh"];
+		const thinkingLower = frontmatter.thinking?.toLowerCase();
+		const thinking = validThinkingLevels.includes(thinkingLower)
+			? (thinkingLower as ThinkingLevel)
+			: undefined;
+
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
+			thinking,
 			extensions,
 			skills,
 			contextFiles,

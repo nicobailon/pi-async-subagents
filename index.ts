@@ -30,7 +30,7 @@ import {
 	type ToolDefinition,
 	getMarkdownTheme,
 } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, matchesKey, Spacer, Text } from "@mariozechner/pi-tui";
+import { Container, Input, Markdown, matchesKey, Spacer, Text, truncateToWidth, type TUI, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import {
@@ -107,126 +107,272 @@ function appendOutputLines(id: string, lines: string[]): void {
 
 /**
  * Overlay component for observing subagent execution in real-time.
- * Shows streaming output, tool calls, and progress.
+ * Full-screen overlay with streaming output, tool calls, progress, and optional input.
  */
-class SubagentOverlay extends Container {
+class SubagentOverlay implements Component {
 	private updateInterval: ReturnType<typeof setInterval> | null = null;
 	private done: () => void;
+	private tui: TUI;
 	private scrollOffset = 0; // 0 = showing most recent, positive = scrolled up into history
-	private maxVisibleLines = 20;
+	private inputMode = false; // Whether the input field is focused
+	private input: Input;
+	private cachedLines: string[] | null = null;
 
-	constructor(done: () => void) {
-		super();
+	// Width property tells TUI how wide to make the overlay
+	public width: number;
+
+	constructor(tui: TUI, done: () => void) {
+		this.tui = tui;
 		this.done = done;
-		this.refresh();
+		// Full width minus small margin
+		this.width = Math.max(60, (process.stdout.columns || 120) - 4);
+		
+		// Create input component for optional user prompts
+		this.input = new Input();
+		this.input.onSubmit = (value) => {
+			if (value.trim() && activeExecution && !activeExecution.isComplete) {
+				// TODO: Send prompt to subagent (requires SDK support)
+				// For now, just show that input was received
+				activeExecution.allOutput.push(`> ${value}`);
+				this.input.setValue("");
+				this.inputMode = false; // Exit input mode after submit
+				this.cachedLines = null;
+				this.tui.requestRender();
+			}
+		};
+		this.input.onEscape = () => {
+			this.inputMode = false;
+			this.cachedLines = null;
+			this.tui.requestRender();
+		};
 
 		// Periodically refresh to show updated progress
-		this.updateInterval = setInterval(() => this.refresh(), 100);
+		this.updateInterval = setInterval(() => {
+			this.cachedLines = null;
+			this.tui.requestRender();
+		}, 100);
 
 		// Register for updates from active execution
-		overlayUpdateCallback = () => this.refresh();
+		overlayUpdateCallback = () => {
+			this.cachedLines = null;
+			this.tui.requestRender();
+		};
 	}
 
-	override invalidate(): void {
-		super.invalidate();
+	invalidate(): void {
+		this.cachedLines = null;
+		this.input.invalidate?.();
 	}
 
-	refresh(): void {
-		this.children = [];
+	render(width: number): string[] {
+		// Use cached lines if available
+		if (this.cachedLines && this.cachedLines.length > 0) {
+			return this.cachedLines;
+		}
+
+		const termHeight = process.stdout.rows || 40;
+		const maxOutputLines = Math.max(1, termHeight - 12); // Reserve space for header, footer, input
+		const lines: string[] = [];
+		
+		// ANSI color helpers
+		const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+		const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
+		const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
+		const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
+		const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
+		const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
+		
+		// Helper to pad string to visible width (accounts for ANSI codes)
+		const padVisible = (s: string, targetWidth: number) => {
+			const visible = visibleWidth(s);
+			const padding = Math.max(0, targetWidth - visible);
+			return s + " ".repeat(padding);
+		};
+
+		// Ensure minimum width for rendering
+		const safeWidth = Math.max(20, width);
+		
+		// Top border
+		const horizLine = "─".repeat(safeWidth - 2);
+		lines.push(dim(`┌${horizLine}┐`));
 
 		if (!activeExecution) {
-			this.addChild(new Text("No active subagent execution.", 1, 1));
-			return;
+			lines.push(dim("│") + " No active subagent execution.".padEnd(safeWidth - 2) + dim("│"));
+			lines.push(dim(`└${horizLine}┘`));
+			this.cachedLines = lines;
+			return lines;
 		}
 
 		const exec = activeExecution;
 		const elapsed = Date.now() - exec.startTime;
 		const elapsedStr = formatDuration(elapsed);
 
-		// Header
+		// Header with status
 		const modeLabel = exec.mode === "chain" && exec.chainStep !== undefined
 			? `chain ${exec.chainStep + 1}/${exec.chainTotal}`
 			: exec.mode;
 		const statusIcon = exec.isComplete
-			? (exec.error ? "✗" : "✓")
-			: "◐";
-		const header = `${statusIcon} ${exec.agent} (${modeLabel}) | ${exec.progress.toolCount} tools | ${formatTokens(exec.progress.tokens)} tok | ${elapsedStr}`;
-		this.addChild(new Text(header, 1, 0));
-		this.addChild(new Spacer(1));
+			? (exec.error ? red("✗") : green("✓"))
+			: yellow("◐");
+		const headerText = ` ${statusIcon} ${bold(exec.agent)} ${dim(`(${modeLabel})`)} │ ${exec.progress.toolCount} tools │ ${formatTokens(exec.progress.tokens)} tok │ ${elapsedStr} `;
+		lines.push(dim("│") + padVisible(headerText, safeWidth - 2) + dim("│"));
 
-		// Task
-		const taskPreview = exec.task.length > 100 ? exec.task.slice(0, 97) + "..." : exec.task;
-		this.addChild(new Text(`Task: ${taskPreview}`, 1, 0));
-		this.addChild(new Spacer(1));
+		// Separator
+		lines.push(dim(`├${horizLine}┤`));
+
+		// Task (truncated if needed)
+		const taskMaxLen = Math.max(10, safeWidth - 10);
+		const taskText = exec.task.length > taskMaxLen ? exec.task.slice(0, Math.max(0, taskMaxLen - 3)) + "..." : exec.task;
+		lines.push(dim("│") + padVisible(` ${dim("Task:")} ${taskText}`, safeWidth - 2) + dim("│"));
 
 		// Current tool (if running)
 		if (exec.progress.currentTool && !exec.isComplete) {
-			const toolInfo = exec.progress.currentToolArgs
-				? `${exec.progress.currentTool}: ${exec.progress.currentToolArgs.slice(0, 60)}${exec.progress.currentToolArgs.length > 60 ? "..." : ""}`
-				: exec.progress.currentTool;
-			this.addChild(new Text(`▶ ${toolInfo}`, 1, 0));
-			this.addChild(new Spacer(1));
+			const toolMaxLen = Math.max(20, safeWidth - 12);
+			const toolArgs = exec.progress.currentToolArgs || "";
+			const argsSpace = Math.max(0, toolMaxLen - exec.progress.currentTool.length - 5);
+			const toolText = toolArgs.length > argsSpace
+				? `${exec.progress.currentTool}: ${toolArgs.slice(0, argsSpace)}...`
+				: `${exec.progress.currentTool}: ${toolArgs}`;
+			lines.push(dim("│") + padVisible(` ${cyan("▶")} ${toolText}`, safeWidth - 2) + dim("│"));
 		}
 
-		// Output (scrollable area)
-		// scrollOffset=0 shows most recent, higher values scroll up into history
-		this.addChild(new Text("─── Output ───", 1, 0));
+		// Output section header
+		lines.push(dim(`├${horizLine}┤`));
+		const outputLabel = ` Output ${dim(`(${exec.allOutput.length} lines)`)} `;
+		lines.push(dim("│") + padVisible(outputLabel, safeWidth - 2) + dim("│"));
+		lines.push(dim(`├${horizLine}┤`));
+
+		// Output lines (scrollable)
 		const totalLines = exec.allOutput.length;
 		if (totalLines > 0) {
-			// Calculate slice indices: we want to show lines ending at (totalLines - scrollOffset)
 			const endIdx = Math.max(0, totalLines - this.scrollOffset);
-			const startIdx = Math.max(0, endIdx - this.maxVisibleLines);
+			const startIdx = Math.max(0, endIdx - maxOutputLines);
 			const outputLines = exec.allOutput.slice(startIdx, endIdx);
 			
 			for (const line of outputLines) {
-				this.addChild(new Text(line, 1, 0));
+				// Use truncateToWidth for proper ANSI-aware truncation
+				const maxLineWidth = Math.max(1, safeWidth - 4);
+				const truncatedLine = truncateToWidth(line, maxLineWidth);
+				lines.push(dim("│") + padVisible(` ${truncatedLine}`, safeWidth - 2) + dim("│"));
 			}
 			
-			// Show scroll indicator if there's more content
+			// Pad with empty lines if needed
+			for (let i = outputLines.length; i < maxOutputLines; i++) {
+				lines.push(dim("│") + " ".repeat(safeWidth - 2) + dim("│"));
+			}
+
+			// Scroll indicator
 			if (this.scrollOffset > 0 || startIdx > 0) {
-				const indicator = startIdx > 0 && this.scrollOffset > 0
-					? `↑ ${startIdx} more lines above | ↓ ${this.scrollOffset} more below`
-					: startIdx > 0
-						? `↑ ${startIdx} more lines above`
-						: `↓ ${this.scrollOffset} more below`;
-				this.addChild(new Text(indicator, 1, 0));
+				const upArrow = startIdx > 0 ? `↑${startIdx}` : "";
+				const downArrow = this.scrollOffset > 0 ? `↓${this.scrollOffset}` : "";
+				const scrollText = [upArrow, downArrow].filter(Boolean).join(" │ ");
+				lines.push(dim(`├${horizLine}┤`));
+				lines.push(dim("│") + padVisible(` ${dim(scrollText)}`, safeWidth - 2) + dim("│"));
 			}
 		} else {
-			this.addChild(new Text("(waiting for output...)", 1, 0));
+			lines.push(dim("│") + padVisible(dim(" (waiting for output...)"), safeWidth - 2) + dim("│"));
+			for (let i = 1; i < maxOutputLines; i++) {
+				lines.push(dim("│") + " ".repeat(safeWidth - 2) + dim("│"));
+			}
 		}
-
-		// Footer with controls
-		this.addChild(new Spacer(1));
-		const controls = exec.isComplete
-			? "[q/Esc/Enter] Close"
-			: "[q/Esc] Close | [↑/↓] Scroll";
-		this.addChild(new Text(controls, 1, 0));
 
 		// Error if any
 		if (exec.error) {
-			this.addChild(new Spacer(1));
-			this.addChild(new Text(`Error: ${exec.error}`, 1, 0));
+			lines.push(dim(`├${horizLine}┤`));
+			const errMaxLen = Math.max(10, safeWidth - 15);
+			const errText = ` ${red("Error:")} ${exec.error.slice(0, errMaxLen)}`;
+			lines.push(dim("│") + padVisible(errText, safeWidth - 2) + dim("│"));
 		}
+
+		// Footer with controls
+		lines.push(dim(`├${horizLine}┤`));
+		const controls = exec.isComplete
+			? `${dim("[q/Esc]")} Close`
+			: `${dim("[q/Esc]")} Close  ${dim("[↑/↓]")} Scroll  ${dim("[i]")} Input`;
+		lines.push(dim("│") + padVisible(` ${controls}`, safeWidth - 2) + dim("│"));
+
+		// Input area (if in input mode)
+		if (this.inputMode && !exec.isComplete) {
+			lines.push(dim(`├${horizLine}┤`));
+			// Input component already renders with "> " prompt and cursor
+			const inputLines = this.input.render(Math.max(10, safeWidth - 4));
+			const inputText = inputLines[0] || "> ";
+			// Use padVisible since input may have ANSI codes for cursor
+			lines.push(dim("│") + " " + padVisible(inputText, safeWidth - 4) + dim("│"));
+		}
+
+		// Bottom border
+		lines.push(dim(`└${horizLine}┘`));
+
+		this.cachedLines = lines;
+		return lines;
 	}
 
 	handleInput(data: string): void {
-		// Escape, Enter, or 'q' closes the overlay
-		// Use matchesKey for proper Kitty keyboard protocol support
-		if (matchesKey(data, "escape") || matchesKey(data, "enter") || matchesKey(data, "q")) {
+		// If in input mode, forward to input component (except escape)
+		if (this.inputMode) {
+			if (matchesKey(data, "escape")) {
+				this.inputMode = false;
+				this.cachedLines = null;
+				this.tui.requestRender();
+				return;
+			}
+			this.input.handleInput(data);
+			this.cachedLines = null;
+			this.tui.requestRender();
+			return;
+		}
+
+		// Close overlay
+		if (matchesKey(data, "escape") || matchesKey(data, "q")) {
 			this.done();
 			return;
 		}
 
-		const totalLines = activeExecution?.allOutput.length ?? 0;
-		const maxScroll = Math.max(0, totalLines - this.maxVisibleLines);
+		// Enter input mode
+		if (matchesKey(data, "i") && activeExecution && !activeExecution.isComplete) {
+			this.inputMode = true;
+			this.cachedLines = null;
+			this.tui.requestRender();
+			return;
+		}
 
-		// Arrow keys for scrolling (use matchesKey for Kitty protocol support)
-		if (matchesKey(data, "up")) {
+		const totalLines = activeExecution?.allOutput.length ?? 0;
+		const termHeight = process.stdout.rows || 40;
+		const maxOutputLines = Math.max(1, termHeight - 12); // Same calculation as render()
+		const maxScroll = Math.max(0, totalLines - maxOutputLines);
+
+		// Scrolling - line by line
+		if (matchesKey(data, "up") || matchesKey(data, "k")) {
 			this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
-			this.refresh();
-		} else if (matchesKey(data, "down")) {
+			this.cachedLines = null;
+			this.tui.requestRender();
+		} else if (matchesKey(data, "down") || matchesKey(data, "j")) {
 			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
-			this.refresh();
+			this.cachedLines = null;
+			this.tui.requestRender();
+		}
+		// Page up/down (raw escape sequences - not in KeyId type)
+		// Format: \x1b[5~ (Page Up), \x1b[6~ (Page Down)
+		// With modifiers: \x1b[5;1~ (no mod), \x1b[5;1:1~ (Kitty with event type)
+		else if (data.startsWith("\x1b[5") && data.endsWith("~")) { // Page Up
+			this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 10);
+			this.cachedLines = null;
+			this.tui.requestRender();
+		} else if (data.startsWith("\x1b[6") && data.endsWith("~")) { // Page Down
+			this.scrollOffset = Math.max(0, this.scrollOffset - 10);
+			this.cachedLines = null;
+			this.tui.requestRender();
+		}
+		// Jump to beginning/end
+		else if (matchesKey(data, "home") || matchesKey(data, "g")) {
+			this.scrollOffset = maxScroll; // Go to beginning
+			this.cachedLines = null;
+			this.tui.requestRender();
+		} else if (matchesKey(data, "end") || matchesKey(data, "shift+g")) {
+			this.scrollOffset = 0; // Go to end (most recent)
+			this.cachedLines = null;
+			this.tui.requestRender();
 		}
 	}
 
@@ -237,6 +383,13 @@ class SubagentOverlay extends Container {
 		}
 		overlayUpdateCallback = null;
 	}
+}
+
+// Helper type for Component interface
+interface Component {
+	render(width: number): string[];
+	handleInput?(data: string): void;
+	invalidate?(): void;
 }
 
 const RESULTS_DIR = "/tmp/pi-async-subagent-results";
@@ -1838,7 +1991,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 			// Show the overlay
 			await ctx.ui.custom(
-				(_tui, _theme, _kb, done) => new SubagentOverlay(() => done(undefined)),
+				(tui, _theme, _kb, done) => {
+					const overlay = new SubagentOverlay(tui, () => {
+						overlay.dispose(); // Clean up interval before closing
+						done(undefined);
+					});
+					return overlay;
+				},
 				{ overlay: true }
 			);
 		},

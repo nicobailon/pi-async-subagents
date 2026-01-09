@@ -12,15 +12,18 @@
   - Automatically inherits parent session context
   - Result is injected back into session, triggering main agent to respond
 - **Ctrl+Shift+O interactive overlay**: Full-screen view during sync subagent execution
+  - Beautiful box-drawing UI with borders and colors
   - Shows real-time progress: agent, task, tools, tokens, elapsed time
   - Streams output as it's generated
-  - Scrollable output history with ↑/↓ keys
+  - Scrollable output with ↑/↓/j/k, PgUp/PgDn, Home/End/g/G navigation
+  - Input mode (press 'i') for sending prompts to subagent (placeholder for future)
   - Works for single and chain modes (not parallel)
   - Uses Ctrl+Shift+O to avoid conflicting with default Ctrl+O (expand tool result)
 - **SDK-based execution**: Sync mode now uses `createAgentSession()` directly instead of spawning subprocesses
 - **Agent-scoped extensions**: New `extensions` frontmatter field to load extensions only for specific agents
 - **Agent-scoped skills**: New `skills` frontmatter field to inject skills only for specific agents
 - **Agent-scoped context**: New `contextFiles` frontmatter field for per-agent AGENTS.md-style context
+- **Thinking level**: New `thinking` frontmatter field to set extended thinking level (off, minimal, low, medium, high, xhigh)
 - New `sdk-runner.ts` module for SDK-based agent execution
 - New `tool-resolver.ts` module for mapping tool names to tool instances
 - New `loaders.ts` module for loading skills and context files from paths
@@ -57,6 +60,17 @@
 - Overlay: Added 'q' as alternative close key
 - `/background` command: Improved error messages to show more context instead of "Unknown error"
 - Renamed `AgentProgress` to `SDKProgress` in sdk-runner.ts to avoid type confusion with types.ts
+- Overlay: Use `visibleWidth` for proper ANSI-aware string padding (fixes alignment issues)
+- Overlay: Use `truncateToWidth` for proper ANSI-aware line truncation
+- Overlay: Remove invalid `matchesKey` calls for pageup/pagedown (not in KeyId type)
+- Overlay: Fix memory leak - `dispose()` now called when overlay closes (clears interval)
+- Overlay: Input escape callback now triggers re-render
+- Overlay: Input submit now exits input mode and triggers re-render
+- Overlay: `maxOutputLines` now has minimum of 1 for small terminals (consistent in render and handleInput)
+- Overlay: Remove unused `Box` import
+- Overlay: Fix Page Up/Down to handle all modifier variants with startsWith pattern
+- Overlay: Fix potential crash with small terminal widths (String.repeat with negative value)
+- Overlay: Add safeWidth guard and Math.max guards for all truncation operations
 - Async widget elapsed time now freezes when job completes instead of continuing to count up
 - Progress data now correctly linked to results during execution (was showing "ok" instead of "...")
 - Chain mode now sums step durations instead of taking max (was showing incorrect total time)

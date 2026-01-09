@@ -41,6 +41,7 @@ Define agents in markdown files at `~/.pi/agent/agents/` (user scope) or `.pi/ag
 name: my-agent
 description: Short description for agent listing
 model: claude-sonnet-4-20250514
+thinking: high
 tools: read, bash, grep, find, ls
 extensions: ./hooks/enforce-json.ts, ./hooks/block-writes.ts
 skills: ./skills/security-checklist
@@ -57,10 +58,13 @@ Your agent's system prompt goes here...
 | `name` | string | **Required.** Agent identifier |
 | `description` | string | **Required.** Short description shown in agent listings |
 | `model` | string | Model to use (e.g., `claude-sonnet-4-20250514`). Default: parent's model |
+| `thinking` | string | Extended thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`* |
 | `tools` | string | Comma-separated list of tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` |
-| `extensions` | string | **NEW.** Comma-separated paths to extension files (agent-scoped) |
-| `skills` | string | **NEW.** Comma-separated paths to skill directories (agent-scoped) |
-| `contextFiles` | string | **NEW.** Comma-separated paths to context files like AGENTS.md (agent-scoped) |
+| `extensions` | string | Comma-separated paths to extension files (agent-scoped) |
+| `skills` | string | Comma-separated paths to skill directories (agent-scoped) |
+| `contextFiles` | string | Comma-separated paths to context files like AGENTS.md (agent-scoped) |
+
+\* `xhigh` is only supported by certain models (e.g., `claude-sonnet-4-20250514`). Using it with unsupported models like `claude-opus-4-5-20250514` will cause an API error. Most models support up to `high`.
 
 ### Path Resolution
 
