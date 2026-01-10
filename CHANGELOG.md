@@ -21,13 +21,18 @@
   - Shows last 5 lines of streaming output, updates as new data arrives
   - Lines prefixed with `  ` to distinguish from other output
   - Preview replaced (not accumulated) on each update for compact display
-- **Interrupt subagent** (`[x]`): Abort current tool (e.g., stuck bash), session ends
+- **Interrupt subagent** (`[x]`): Abort current tool, auto-opens input for steering
+  - Sends heartbeat message telling agent to wait for instructions (if steer available)
+  - Shows "[interrupted - agent paused...]" with steer, or "[interrupted - tool aborted]" without
+  - Input mode auto-enabled so user can immediately type steering message
+  - Properly chains interrupt → steer with success/error feedback
 - **Abort subagent** (`[X]`): Kill entire subagent session, return to parent
 - **Architecture documentation**: Added `docs/ARCHITECTURE.md` with ASCII diagrams
 - **README improvements**: Added experimental prototype warning banner and screenshot
 
 ### Changed
-- Overlay width increased to max 120 columns (80% of terminal width) for better content visibility
+- Overlay width reduced to max 100 columns (75% of terminal width) as workaround for pi-mono compositing edge cases
+- Token display now shows input + output only (excludes cached tokens which inflate the numbers)
 - Overlay output area capped at 20 lines to prevent excessive height
 - Tool/status line always shown for consistent overlay height (shows "Working..." or "Completed")
 - Scroll indicator section always present for consistent height
@@ -50,13 +55,17 @@
 - **Chain execution tracking**: Fixed "No active subagent execution" appearing mid-chain
   - Now keeps `lastCompletedExecution` for seamless overlay transitions
   - Overlay shows last execution instead of "no active" during brief gaps
+- **Chain step transition UI**: Added `onUpdate` call after each step completes
+  - Main chat's collapsed view now shows accurate completion status between steps
+  - Prevents "running" icon showing for already-completed steps
 - **Chain step counter mismatch**: Collapsed view now shows correct total steps
   - Added `stepsTotal` to Details interface to track actual chain/parallel length
   - Previously showed `1/1` for step 1 of a 2-step chain
 - **Elapsed time for completed executions**: Now uses final `durationMs` instead of `Date.now() - startTime`
   - Previously kept incrementing after completion
-- **Token count was incomplete**: Now includes all four components (input + output + cacheRead + cacheWrite)
-  - Previously only counted input + output, missing cache tokens
+- **Token count display**: Changed to show only input + output tokens
+  - Cache tokens (cacheRead/cacheWrite) excluded as they inflate displayed numbers
+  - Cache values still tracked separately in progress for detailed inspection
 - **Overlay scrolling with fallback execution**: `handleInput` now uses same fallback as `render()`
   - Previously couldn't scroll when viewing `lastCompletedExecution`
 - **Bash tool name check**: Fixed lowercase "bash" check in sdk-runner (was also checking "Bash")

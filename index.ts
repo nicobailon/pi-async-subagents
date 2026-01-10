@@ -236,8 +236,9 @@ class SubagentOverlay implements Component {
 	constructor(tui: TUI, done: () => void) {
 		this.tui = tui;
 		this.done = done;
-		// Reasonable overlay width - wide enough to show content, max 120 columns
-		this.width = Math.min(120, Math.max(60, Math.floor((process.stdout.columns || 120) * 0.8)));
+		// Reasonable overlay width - wide enough to show content, max 100 columns
+		// Note: Using 0.75 instead of 0.8 as buffer for pi-mono compositing edge cases
+		this.width = Math.min(100, Math.max(60, Math.floor((process.stdout.columns || 100) * 0.75)));
 		
 		// Create input component for optional user prompts
 		this.input = new Input();
@@ -548,16 +549,45 @@ class SubagentOverlay implements Component {
 		// Interrupt current tool (e.g., stuck bash command) - agent continues
 		if (matchesKey(data, "x") && exec && !exec.isComplete && exec.interrupt) {
 			const execId = exec.id; // Capture ID to avoid race condition
-			exec.allOutput.push("[interrupting current tool...]");
-			exec.interrupt().catch((err) => {
-				const errorMsg = err instanceof Error ? err.message : String(err);
-				const currentExec = activeExecutions.get(execId);
-				if (currentExec) {
-					currentExec.allOutput.push(`[interrupt error: ${errorMsg}]`);
-				}
-				this.cachedLines = null;
-				this.tui.requestRender();
-			});
+			const steerFn = exec.steer; // Capture steer function before async operations
+			exec.allOutput.push("[interrupting...]");
+			
+			// Chain: interrupt first, THEN send heartbeat steer
+			exec.interrupt()
+				.then(() => {
+					// Send heartbeat steer message to keep agent waiting for user input
+					if (steerFn) {
+						return steerFn("User interrupted the current operation. STOP and WAIT for further instructions from the user before proceeding.")
+							.then(() => true);
+					}
+					return false; // Steer not available
+				})
+				.then((steered) => {
+					// Show success feedback
+					const currentExec = activeExecutions.get(execId);
+					if (currentExec) {
+						if (steered) {
+							currentExec.allOutput.push("[interrupted - agent paused, type message to continue]");
+						} else {
+							currentExec.allOutput.push("[interrupted - tool aborted]");
+						}
+						this.cachedLines = null;
+						this.tui.requestRender();
+					}
+				})
+				.catch((err) => {
+					const errorMsg = err instanceof Error ? err.message : String(err);
+					const currentExec = activeExecutions.get(execId);
+					if (currentExec) {
+						currentExec.allOutput.push(`[interrupt/steer error: ${errorMsg}]`);
+						this.cachedLines = null;
+						this.tui.requestRender();
+					}
+				});
+			
+			// Automatically enable input mode so user can steer the agent
+			this.inputMode = true;
+			this.tui.setFocus(this.input);
 			this.cachedLines = null;
 			this.tui.requestRender();
 			return;
@@ -1306,8 +1336,8 @@ async function runSync(
 	progress.status = result.exitCode === 0 ? "completed" : "failed";
 	progress.durationMs = Date.now() - startTime;
 	// toolCount is already tracked via onProgress callbacks, don't reset it
-	// Total tokens = all four components (matches Anthropic's totalTokens calculation)
-	progress.tokens = sdkResult.usage.input + sdkResult.usage.output + sdkResult.usage.cacheRead + sdkResult.usage.cacheWrite;
+	// Show only input + output for token count (excludes cached tokens which inflate the number)
+	progress.tokens = sdkResult.usage.input + sdkResult.usage.output;
 	if (result.error) {
 		progress.error = result.error;
 		if (progress.currentTool) {
@@ -1812,6 +1842,21 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						results.push(r);
 						if (r.progress) allProgress.push(r.progress);
 						if (r.artifactPaths) allArtifactPaths.push(r.artifactPaths);
+						
+						// Send final update after step completes so UI shows accurate status
+						// before next step starts (prevents "running" showing for completed step)
+						if (onUpdate) {
+							onUpdate({
+								content: [{ type: "text", text: getFinalOutput(r.messages) || "(step completed)" }],
+								details: {
+									mode: "chain",
+									stepsTotal: params.chain.length,
+									results,
+									progress: allProgress,
+									artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
+								},
+							});
+						}
 						if (r.exitCode !== 0) {
 							// Clear execution tracking on chain failure
 							clearCompletedExecutions();

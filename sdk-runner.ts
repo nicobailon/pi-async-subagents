@@ -253,8 +253,8 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 								usage.cacheRead += u.cacheRead || 0;
 								usage.cacheWrite += u.cacheWrite || 0;
 								usage.cost += u.cost?.total || 0;
-								// Total tokens = all four components (matches Anthropic's totalTokens calculation)
-								progress.tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+								// Show only input + output for live token count (excludes cached tokens which inflate the number)
+								progress.tokens = usage.input + usage.output;
 								progress.cacheRead = usage.cacheRead;
 								progress.cacheWrite = usage.cacheWrite;
 							}
