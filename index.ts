@@ -80,8 +80,6 @@ interface ActiveExecution {
 	startTime: number;
 	/** Steer function to inject messages into the running subagent */
 	steer?: (message: string) => Promise<void>;
-	/** Interrupt function to cancel the current tool (agent continues) */
-	interrupt?: () => Promise<void>;
 	/** Abort function to kill entire subagent session */
 	abortSession?: () => void;
 }
@@ -491,9 +489,8 @@ class SubagentOverlay implements Component {
 			controls = ` ${dim("[Esc]")} Exit input  ${dim("[Enter]")} Send`;
 		} else {
 			const scrollCtrl = canScroll ? `  ${dim("[↑/↓]")} Scroll` : "";
-			const interruptCtrl = exec.interrupt ? `  ${dim("[x]")} Interrupt` : "";
 			const abortCtrl = exec.abortSession ? `  ${dim("[X]")} Abort` : "";
-			controls = ` ${dim("[q/Esc]")} Close${scrollCtrl}  ${dim("[i]")} Input${interruptCtrl}${abortCtrl}${tabControls}`;
+			controls = ` ${dim("[q/Esc]")} Close${scrollCtrl}  ${dim("[i]")} Input${abortCtrl}${tabControls}`;
 		}
 		lines.push(dim("│") + fitContent(controls, safeWidth - 2) + dim("│"));
 
@@ -541,53 +538,6 @@ class SubagentOverlay implements Component {
 		// Enter input mode
 		if (matchesKey(data, "i") && exec && !exec.isComplete) {
 			this.inputMode = true;
-			this.cachedLines = null;
-			this.tui.requestRender();
-			return;
-		}
-
-		// Interrupt current tool (e.g., stuck bash command) - agent continues
-		if (matchesKey(data, "x") && exec && !exec.isComplete && exec.interrupt) {
-			const execId = exec.id; // Capture ID to avoid race condition
-			const steerFn = exec.steer; // Capture steer function before async operations
-			exec.allOutput.push("[interrupting...]");
-			
-			// Chain: interrupt first, THEN send heartbeat steer
-			exec.interrupt()
-				.then(() => {
-					// Send heartbeat steer message to keep agent waiting for user input
-					if (steerFn) {
-						return steerFn("User interrupted the current operation. STOP and WAIT for further instructions from the user before proceeding.")
-							.then(() => true);
-					}
-					return false; // Steer not available
-				})
-				.then((steered) => {
-					// Show success feedback
-					const currentExec = activeExecutions.get(execId);
-					if (currentExec) {
-						if (steered) {
-							currentExec.allOutput.push("[interrupted - agent paused, type message to continue]");
-						} else {
-							currentExec.allOutput.push("[interrupted - tool aborted]");
-						}
-						this.cachedLines = null;
-						this.tui.requestRender();
-					}
-				})
-				.catch((err) => {
-					const errorMsg = err instanceof Error ? err.message : String(err);
-					const currentExec = activeExecutions.get(execId);
-					if (currentExec) {
-						currentExec.allOutput.push(`[interrupt/steer error: ${errorMsg}]`);
-						this.cachedLines = null;
-						this.tui.requestRender();
-					}
-				});
-			
-			// Automatically enable input mode so user can steer the agent
-			this.inputMode = true;
-			this.tui.setFocus(this.input);
 			this.cachedLines = null;
 			this.tui.requestRender();
 			return;
@@ -1227,10 +1177,6 @@ async function runSync(
 		// Expose the steer function for overlay input
 		onSessionReady: (steer) => {
 			updateActiveExecution(executionId, { steer });
-		},
-		// Expose the interrupt function for cancelling current tool (agent continues)
-		onInterruptReady: (interrupt) => {
-			updateActiveExecution(executionId, { interrupt });
 		},
 		// Stream bash output to overlay (replaces previous preview)
 		onBashOutput: (lines) => {

@@ -21,12 +21,7 @@
   - Shows last 5 lines of streaming output, updates as new data arrives
   - Lines prefixed with `  ` to distinguish from other output
   - Preview replaced (not accumulated) on each update for compact display
-- **Interrupt subagent** (`[x]`): Abort current tool, auto-opens input for steering
-  - Sends heartbeat message telling agent to wait for instructions (if steer available)
-  - Shows "[interrupted - agent paused...]" with steer, or "[interrupted - tool aborted]" without
-  - Input mode auto-enabled so user can immediately type steering message
-  - Properly chains interrupt → steer with success/error feedback
-- **Abort subagent** (`[X]`): Kill entire subagent session, return to parent
+- **Abort subagent** (`[X]`): Kill entire subagent session immediately, return to parent
 - **Architecture documentation**: Added `docs/ARCHITECTURE.md` with ASCII diagrams
 - **README improvements**: Added experimental prototype warning banner and screenshot
 
