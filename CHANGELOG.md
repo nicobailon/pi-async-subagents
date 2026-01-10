@@ -21,6 +21,10 @@
   - Shows last 5 lines of streaming output, updates as new data arrives
   - Lines prefixed with `  ` to distinguish from other output
   - Preview replaced (not accumulated) on each update for compact display
+- **Skip chain step** (`[S]`): Skip stuck step and continue to next (chains only)
+  - Aborts current step but continues chain with last successful output
+  - Progress from skipped step is preserved
+  - Shows "[skipping to next step...]" feedback
 - **Abort subagent** (`[X]`): Kill entire subagent session immediately, return to parent
 - **Architecture documentation**: Added `docs/ARCHITECTURE.md` with ASCII diagrams
 - **README improvements**: Added experimental prototype warning banner and screenshot

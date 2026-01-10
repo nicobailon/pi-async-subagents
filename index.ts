@@ -82,6 +82,8 @@ interface ActiveExecution {
 	steer?: (message: string) => Promise<void>;
 	/** Abort function to kill entire subagent session */
 	abortSession?: () => void;
+	/** Skip function to skip current chain step and continue (chains only) */
+	skipStep?: () => void;
 }
 
 // Track multiple executions (for parallel mode)
@@ -234,9 +236,9 @@ class SubagentOverlay implements Component {
 	constructor(tui: TUI, done: () => void) {
 		this.tui = tui;
 		this.done = done;
-		// Reasonable overlay width - wide enough to show content, max 100 columns
-		// Note: Using 0.75 instead of 0.8 as buffer for pi-mono compositing edge cases
-		this.width = Math.min(100, Math.max(60, Math.floor((process.stdout.columns || 100) * 0.75)));
+		// Overlay width - conservative to avoid pi-mono compositing bug until fix is published
+		// Bug: compositeLineAt arithmetic can undercount width, causing TUI crash
+		this.width = Math.min(75, Math.max(50, Math.floor((process.stdout.columns || 80) * 0.6)));
 		
 		// Create input component for optional user prompts
 		this.input = new Input();
@@ -489,8 +491,9 @@ class SubagentOverlay implements Component {
 			controls = ` ${dim("[Esc]")} Exit input  ${dim("[Enter]")} Send`;
 		} else {
 			const scrollCtrl = canScroll ? `  ${dim("[↑/↓]")} Scroll` : "";
+			const skipCtrl = exec.skipStep ? `  ${dim("[S]")} Skip` : "";
 			const abortCtrl = exec.abortSession ? `  ${dim("[X]")} Abort` : "";
-			controls = ` ${dim("[q/Esc]")} Close${scrollCtrl}  ${dim("[i]")} Input${abortCtrl}${tabControls}`;
+			controls = ` ${dim("[q/Esc]")} Close${scrollCtrl}  ${dim("[i]")} Input${skipCtrl}${abortCtrl}${tabControls}`;
 		}
 		lines.push(dim("│") + fitContent(controls, safeWidth - 2) + dim("│"));
 
@@ -547,6 +550,15 @@ class SubagentOverlay implements Component {
 		if (data === "X" && exec && !exec.isComplete && exec.abortSession) {
 			exec.allOutput.push("[aborting subagent session...]");
 			exec.abortSession();
+			this.cachedLines = null;
+			this.tui.requestRender();
+			return;
+		}
+
+		// Skip current chain step and continue to next
+		if (data === "S" && exec && !exec.isComplete && exec.skipStep) {
+			exec.allOutput.push("[skipping to next step...]");
+			exec.skipStep();
 			this.cachedLines = null;
 			this.tui.requestRender();
 			return;
@@ -1069,6 +1081,8 @@ interface RunSyncOptions {
 	parallelTotal?: number;
 	// Initial output lines to show (e.g., chain handoff info)
 	initialOutput?: string[];
+	// Skip function for chain steps (allows skipping to next step)
+	onSkipStep?: () => void;
 }
 
 async function runSync(
@@ -1078,7 +1092,7 @@ async function runSync(
 	task: string,
 	options: RunSyncOptions,
 ): Promise<SingleResult> {
-	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, authStorage, modelRegistry, inheritMessages, mode, chainStep, chainTotal, parallelIndex, parallelTotal, initialOutput } = options;
+	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, authStorage, modelRegistry, inheritMessages, mode, chainStep, chainTotal, parallelIndex, parallelTotal, initialOutput, onSkipStep } = options;
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		return {
@@ -1160,9 +1174,11 @@ async function runSync(
 		? AbortSignal.any([signal, sessionAbortController.signal])
 		: sessionAbortController.signal;
 	
-	// Store abort function for overlay
+	// Store abort and skip functions for overlay
 	updateActiveExecution(executionId, { 
-		abortSession: () => sessionAbortController.abort() 
+		abortSession: () => sessionAbortController.abort(),
+		// skipStep only available for chain executions
+		skipStep: onSkipStep,
 	});
 
 	// Run via SDK
@@ -1733,6 +1749,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				const results: SingleResult[] = [];
 				let prev = "";
 				let chainHandoff: { fromStep: number; preview: string } | null = null;
+				const skippedSteps = new Set<number>();
 				try {
 					for (let i = 0; i < params.chain.length; i++) {
 						const step = params.chain[i];
@@ -1753,9 +1770,18 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 							];
 						}
 						
+						// Create abort controller for this step (allows skip to abort just this step)
+						const stepController = new AbortController();
+						let stepSkipped = false;
+						
+						// Combine with parent signal if present
+						const stepSignal = signal 
+							? AbortSignal.any([signal, stepController.signal])
+							: stepController.signal;
+						
 						const r = await runSync(ctx.cwd, agents, step.agent, taskWithPrev, {
 							cwd: step.cwd ?? params.cwd,
-							signal,
+							signal: stepSignal,
 							runId,
 							index: i,
 							sessionDir: sessionDirForIndex(i),
@@ -1772,6 +1798,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 							chainTotal: params.chain.length,
 							// Show handoff info from previous step
 							initialOutput: stepInitialOutput,
+							// Provide skip function for this step
+							onSkipStep: () => {
+								stepSkipped = true;
+								skippedSteps.add(i);
+								stepController.abort();
+							},
 							onUpdate: onUpdate
 								? (p) =>
 										onUpdate({
@@ -1793,7 +1825,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						// before next step starts (prevents "running" showing for completed step)
 						if (onUpdate) {
 							onUpdate({
-								content: [{ type: "text", text: getFinalOutput(r.messages) || "(step completed)" }],
+								content: [{ type: "text", text: stepSkipped ? "(step skipped)" : getFinalOutput(r.messages) || "(step completed)" }],
 								details: {
 									mode: "chain",
 									stepsTotal: params.chain.length,
@@ -1803,6 +1835,20 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 								},
 							});
 						}
+						
+						// If step was skipped, continue to next step instead of failing
+						if (stepSkipped) {
+							// Keep prev as-is (use last successful output)
+							// Store handoff info indicating skip
+							if (i < params.chain.length - 1) {
+								chainHandoff = {
+									fromStep: i + 1,
+									preview: prev ? (prev.length > 300 ? prev.slice(0, 297) + "..." : prev) : "(previous step skipped)",
+								};
+							}
+							continue;
+						}
+						
 						if (r.exitCode !== 0) {
 							// Clear execution tracking on chain failure
 							clearCompletedExecutions();
