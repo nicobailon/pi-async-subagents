@@ -12,12 +12,28 @@
   - Uses SDK's `session.steer()` to inject messages into running session
   - Proper error handling for both sync and async steer errors
   - Shows `[steering not available yet]` if session still initializing
+- **Animated spinner**: Shows `⠋ Working...` with cycling braille animation when waiting for LLM response
+- **Tool call transparency**: Logs `▶ toolName: args` to overlay output when each tool starts
+- **Chain handoff observability**: Shows preview of `{previous}` content when chain steps transition
+  - Displays "Received from step N" header with first 10 lines of output
+  - Helps understand what data flows between chain steps
+- **Streaming bash output**: Real-time preview of bash command output in overlay
+  - Shows last 5 lines of streaming output, updates as new data arrives
+  - Lines prefixed with `  ` to distinguish from other output
+  - Preview replaced (not accumulated) on each update for compact display
+- **Interrupt subagent** (`[x]`): Abort current tool (e.g., stuck bash), session ends
+- **Abort subagent** (`[X]`): Kill entire subagent session, return to parent
+- **Architecture documentation**: Added `docs/ARCHITECTURE.md` with ASCII diagrams
+- **README improvements**: Added experimental prototype warning banner and screenshot
 
 ### Changed
-- Overlay width reduced to max 100 columns (70% of terminal width) for better readability
+- Overlay width increased to max 120 columns (80% of terminal width) for better content visibility
 - Overlay output area capped at 20 lines to prevent excessive height
-- Tool/status line always shown for consistent overlay height (shows "Waiting..." or "Completed")
+- Tool/status line always shown for consistent overlay height (shows "Working..." or "Completed")
 - Scroll indicator section always present for consistent height
+- Dynamic overlay controls: `[↑/↓] Scroll` only shown when content is scrollable
+- Input mode controls: Shows `[Esc] Exit input  [Enter] Send` instead of normal controls
+- Auto-exit input mode when execution completes
 
 ### Fixed
 - **Overlay text overflow**: All content now properly truncated with `fitContent()` helper
@@ -31,6 +47,20 @@
   - On success, failure, or unexpected exceptions
   - Prevents stale execution state from lingering
 - **Overlay flickering**: Fixed by ensuring consistent height across all render states
+- **Chain execution tracking**: Fixed "No active subagent execution" appearing mid-chain
+  - Now keeps `lastCompletedExecution` for seamless overlay transitions
+  - Overlay shows last execution instead of "no active" during brief gaps
+- **Chain step counter mismatch**: Collapsed view now shows correct total steps
+  - Added `stepsTotal` to Details interface to track actual chain/parallel length
+  - Previously showed `1/1` for step 1 of a 2-step chain
+- **Elapsed time for completed executions**: Now uses final `durationMs` instead of `Date.now() - startTime`
+  - Previously kept incrementing after completion
+- **Token count was incomplete**: Now includes all four components (input + output + cacheRead + cacheWrite)
+  - Previously only counted input + output, missing cache tokens
+- **Overlay scrolling with fallback execution**: `handleInput` now uses same fallback as `render()`
+  - Previously couldn't scroll when viewing `lastCompletedExecution`
+- **Bash tool name check**: Fixed lowercase "bash" check in sdk-runner (was also checking "Bash")
+- **Race condition in interrupt handler**: Captures execution ID to ensure errors go to correct execution
 - Removed dead code: unused `getActiveExecution()` function
 - Fixed chain code indentation for readability
 

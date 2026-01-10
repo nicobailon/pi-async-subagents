@@ -22,6 +22,8 @@ export interface AgentProgress {
 	recentOutput: string[];
 	toolCount: number;
 	tokens: number;
+	cacheRead: number;
+	cacheWrite: number;
 	durationMs: number;
 	error?: string;
 	failedTool?: string;

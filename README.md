@@ -1,6 +1,10 @@
 # pi-async-subagents
 
+> ⚠️ **Experimental Prototype** — This extension is under active development and not yet recommended for general use. APIs may change, bugs are expected, and features are incomplete. Stabilization coming soon.
+
 Pi extension for delegating tasks to subagents with SDK-based execution, agent-scoped extensions/skills/context, async support, output truncation, debug artifacts, and progress tracking.
+
+<img width="1257" alt="Subagent overlay showing real-time execution" src="https://github.com/user-attachments/assets/1dc51d03-cd0c-45b4-92aa-8021523460d1" />
 
 ## 🔓 What This Unlocks
 
@@ -25,7 +29,11 @@ Build **specialized agents with their own behaviors** — a read-only scout that
 - **Agent-Scoped Context**: Provide AGENTS.md-style context files per agent
 - **Context Inheritance**: Subagents can inherit the parent session's conversation history
 - **`/background` Slash Command**: Quick invocation with inherited context
-- **Ctrl+Shift+O Overlay**: Expand any sync subagent execution to full-screen interactive view
+- **Ctrl+Shift+O Overlay**: Full-screen interactive view with steering, interrupt, and multi-agent support
+- **Subagent Steering**: Send messages to running subagents via overlay input mode
+- **Interrupt/Abort**: Kill stuck operations or terminate sessions from the overlay
+- **Streaming Bash Output**: Real-time preview of bash command output in overlay
+- **Multi-Agent Tracking**: Tab between parallel agents, see status of each
 - **Live Progress Display**: Real-time visibility during sync execution showing current tool, recent output, tokens, and duration
 - **Output Truncation**: Configurable byte/line limits via `maxOutput`
 - **Debug Artifacts**: Input/output/metadata files per task
@@ -274,26 +282,49 @@ During sync execution, the collapsed view shows:
 - Recent output lines (last 2-3 lines)
 - Hint: `(ctrl+shift+o for overlay)`
 
-Press **Ctrl+Shift+O** to expand the full streaming view with complete output.
+Press **Ctrl+Shift+O** to expand the full streaming view with:
+- Complete scrollable output history
+- Tool calls as they happen (`▶ toolName: args`)
+- Streaming bash output (last 5 lines, live updates)
+- Chain handoff previews showing `{previous}` content
+- Steering input, interrupt, and abort controls
 
 ## Interactive Overlay (Ctrl+Shift+O)
 
 During any sync subagent execution, press **Ctrl+Shift+O** to open a full-screen interactive overlay:
 
 **What it shows:**
-- Agent name, task, and execution mode (single/chain step N/M)
+- Agent name, task, and execution mode (single/chain step N/M/parallel N/M)
 - Real-time progress: tool count, tokens, elapsed time
 - Current tool being executed with arguments
-- Streaming output as it's generated
+- Animated spinner (`⠋ Working...`) when waiting for LLM response
+- Tool calls logged as they happen (`▶ read: src/file.ts`)
+- Streaming bash output (last 5 lines, updates in real-time)
+- Chain handoff preview showing what `{previous}` contains between steps
 - Completion status (success/error)
 
 **Controls:**
-- **↑/↓** - Scroll through output history
-- **Esc** or **Enter** - Close overlay and return to collapsed view
+| Key | Action |
+|-----|--------|
+| **q** / **Esc** | Close overlay |
+| **↑/↓** / **j/k** | Scroll output (when content is scrollable) |
+| **PgUp/PgDn** | Scroll 10 lines |
+| **Home/End** | Jump to start/end |
+| **i** | Enter input mode (steer the subagent) |
+| **x** | Interrupt - abort current tool, session ends |
+| **X** | Abort - kill entire subagent session |
+| **Tab** / **Shift+Tab** | Switch between parallel agents |
+| **1-9** | Jump to specific agent (parallel mode) |
 
-The overlay updates in real-time as the subagent executes. Even after completion, you can view the final state before dismissing.
+**Input Mode:**
+Press `i` to send a steering message to the running subagent. Type your message and press Enter. The subagent will receive it after the current tool completes. Press Esc to cancel without sending.
 
-**Note:** Parallel mode runs multiple subagents concurrently, so the overlay is not available (no single execution to track).
+**Interrupt vs Abort:**
+- `[x]` Interrupt: Kills the current stuck operation (e.g., hanging bash command). The session ends.
+- `[X]` Abort: Forcefully terminates the entire subagent session immediately.
+
+**Multi-Agent Support:**
+For parallel mode, the overlay tracks all running agents. Use Tab to cycle between them or press 1-9 to jump directly. Each agent shows a status icon: `◐` running, `✓` success, `✗` failed.
 
 ## SDK-Based Execution
 

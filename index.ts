@@ -74,17 +74,23 @@ interface ActiveExecution {
 	parallelTotal?: number; // Total parallel tasks
 	progress: AgentProgress;
 	allOutput: string[]; // Accumulates ALL output lines for scrolling
+	bashPreviewStart?: number; // Index where bash preview lines start (for replacement)
 	isComplete: boolean;
 	error?: string;
 	startTime: number;
 	/** Steer function to inject messages into the running subagent */
 	steer?: (message: string) => Promise<void>;
+	/** Interrupt function to cancel the current tool (agent continues) */
+	interrupt?: () => Promise<void>;
+	/** Abort function to kill entire subagent session */
+	abortSession?: () => void;
 }
 
 // Track multiple executions (for parallel mode)
 const activeExecutions = new Map<string, ActiveExecution>();
 let selectedExecutionId: string | null = null;
 let overlayUpdateCallback: (() => void) | null = null;
+let lastCompletedExecution: ActiveExecution | null = null; // Keep last execution for seamless transitions
 
 // Helper to get the currently selected execution (or first one if none selected)
 function getSelectedExecution(): ActiveExecution | null {
@@ -104,17 +110,20 @@ function setActiveExecution(exec: ActiveExecution | null): void {
 		activeExecutions.clear();
 		selectedExecutionId = null;
 	} else {
+		// New execution starting - clear the "last completed" fallback
+		lastCompletedExecution = null;
 		// Add or replace execution
 		activeExecutions.set(exec.id, exec);
-		// Auto-select if this is the only one or none selected
-		if (activeExecutions.size === 1 || !selectedExecutionId) {
-			selectedExecutionId = exec.id;
-		}
+		// Always select the newly added execution (it's the active one)
+		// For chains, this ensures we follow the current step
+		selectedExecutionId = exec.id;
 	}
 	overlayUpdateCallback?.();
 }
 
 function addExecution(exec: ActiveExecution): void {
+	// New execution starting - clear the "last completed" fallback
+	lastCompletedExecution = null;
 	activeExecutions.set(exec.id, exec);
 	// Auto-select first execution
 	if (activeExecutions.size === 1) {
@@ -140,6 +149,31 @@ function appendOutputLines(id: string, lines: string[]): void {
 			exec.allOutput = exec.allOutput.slice(-1000);
 		}
 		overlayUpdateCallback?.();
+	}
+}
+
+function updateBashPreview(id: string, lines: string[]): void {
+	const exec = activeExecutions.get(id);
+	if (!exec) return;
+	
+	// Prefix lines to distinguish bash output
+	const prefixedLines = lines.map(l => `  ${l}`);
+	
+	if (exec.bashPreviewStart === undefined) {
+		// First bash output - mark start position and append
+		exec.bashPreviewStart = exec.allOutput.length;
+		exec.allOutput.push(...prefixedLines);
+	} else {
+		// Replace existing bash preview lines
+		exec.allOutput.splice(exec.bashPreviewStart, exec.allOutput.length - exec.bashPreviewStart, ...prefixedLines);
+	}
+	overlayUpdateCallback?.();
+}
+
+function clearBashPreview(id: string): void {
+	const exec = activeExecutions.get(id);
+	if (exec) {
+		exec.bashPreviewStart = undefined;
 	}
 }
 
@@ -169,7 +203,11 @@ function selectPrevExecution(): void {
 }
 
 function clearCompletedExecutions(): void {
-	// Clear all executions when done
+	// Save last execution before clearing (for seamless overlay transitions)
+	const lastExec = getSelectedExecution() || Array.from(activeExecutions.values()).pop();
+	if (lastExec) {
+		lastCompletedExecution = { ...lastExec };
+	}
 	activeExecutions.clear();
 	selectedExecutionId = null;
 	overlayUpdateCallback?.();
@@ -179,6 +217,9 @@ function clearCompletedExecutions(): void {
  * Overlay component for observing subagent execution in real-time.
  * Full-screen overlay with streaming output, tool calls, progress, and optional input.
  */
+// Braille spinner frames for animated loading indicator
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 class SubagentOverlay implements Component {
 	private updateInterval: ReturnType<typeof setInterval> | null = null;
 	private done: () => void;
@@ -187,6 +228,7 @@ class SubagentOverlay implements Component {
 	private inputMode = false; // Whether the input field is focused
 	private input: Input;
 	private cachedLines: string[] | null = null;
+	private spinnerFrame = 0; // For animated spinner
 
 	// Width property tells TUI how wide to make the overlay
 	public width: number;
@@ -194,8 +236,8 @@ class SubagentOverlay implements Component {
 	constructor(tui: TUI, done: () => void) {
 		this.tui = tui;
 		this.done = done;
-		// Reasonable overlay width - not too large, max 100 columns
-		this.width = Math.min(100, Math.max(60, Math.floor((process.stdout.columns || 100) * 0.7)));
+		// Reasonable overlay width - wide enough to show content, max 120 columns
+		this.width = Math.min(120, Math.max(60, Math.floor((process.stdout.columns || 120) * 0.8)));
 		
 		// Create input component for optional user prompts
 		this.input = new Input();
@@ -245,8 +287,9 @@ class SubagentOverlay implements Component {
 			this.tui.requestRender();
 		};
 
-		// Periodically refresh to show updated progress
+		// Periodically refresh to show updated progress and animate spinner
 		this.updateInterval = setInterval(() => {
+			this.spinnerFrame = (this.spinnerFrame + 1) % SPINNER_FRAMES.length;
 			this.cachedLines = null;
 			this.tui.requestRender();
 		}, 100);
@@ -305,9 +348,10 @@ class SubagentOverlay implements Component {
 
 		// Get all executions for multi-agent support
 		const allExecs = Array.from(activeExecutions.values());
-		const exec = getSelectedExecution();
-
-		if (!exec || allExecs.length === 0) {
+		
+		// Use last completed execution for seamless transitions when map is empty
+		const exec = getSelectedExecution() || lastCompletedExecution;
+		if (!exec) {
 			const noExecMsg = " No active subagent execution.";
 			lines.push(dim("│") + fitContent(noExecMsg, safeWidth - 2) + dim("│"));
 			lines.push(dim(`└${horizLine}┘`));
@@ -336,7 +380,8 @@ class SubagentOverlay implements Component {
 			lines.push(dim(`├${horizLine}┤`));
 		}
 
-		const elapsed = Date.now() - exec.startTime;
+		// For completed executions, use final duration; for running, calculate from start time
+		const elapsed = exec.isComplete ? exec.progress.durationMs : Date.now() - exec.startTime;
 		const elapsedStr = formatDuration(elapsed);
 
 		// Header with status
@@ -349,6 +394,7 @@ class SubagentOverlay implements Component {
 			? (exec.error ? red("✗") : green("✓"))
 			: yellow("◐");
 		
+		// Token display: total = input + output + cacheRead + cacheWrite
 		const headerText = ` ${statusIcon} ${bold(exec.agent)} ${dim(`(${modeLabel})`)} │ ${exec.progress.toolCount} tools │ ${formatTokens(exec.progress.tokens)} tok │ ${elapsedStr}`;
 		lines.push(dim("│") + fitContent(headerText, safeWidth - 2) + dim("│"));
 
@@ -362,6 +408,7 @@ class SubagentOverlay implements Component {
 		lines.push(dim("│") + fitContent(taskPrefix + taskText, safeWidth - 2) + dim("│"));
 
 		// Current tool / status line (always show for consistent height)
+		const spinner = SPINNER_FRAMES[this.spinnerFrame];
 		if (exec.progress.currentTool && !exec.isComplete) {
 			const toolPrefix = ` ${cyan("▶")} ${exec.progress.currentTool}: `;
 			const toolMaxWidth = safeWidth - 2 - visibleWidth(toolPrefix);
@@ -371,7 +418,8 @@ class SubagentOverlay implements Component {
 			const statusText = exec.error ? ` ${red("✗")} Completed with error` : ` ${green("✓")} Completed`;
 			lines.push(dim("│") + fitContent(statusText, safeWidth - 2) + dim("│"));
 		} else {
-			lines.push(dim("│") + fitContent(` ${yellow("◐")} Waiting...`, safeWidth - 2) + dim("│"));
+			// Show animated spinner with "Working..." when waiting for LLM
+			lines.push(dim("│") + fitContent(` ${yellow(spinner)} Working...`, safeWidth - 2) + dim("│"));
 		}
 
 		// Output section header
@@ -430,10 +478,22 @@ class SubagentOverlay implements Component {
 
 		// Footer with controls
 		lines.push(dim(`├${horizLine}┤`));
-		const tabControls = allExecs.length > 1 ? `  ${dim("[Tab]")} Switch agent  ${dim("[1-9]")} Select` : "";
-		const controls = exec.isComplete
-			? ` ${dim("[q/Esc]")} Close${tabControls}`
-			: ` ${dim("[q/Esc]")} Close  ${dim("[↑/↓]")} Scroll  ${dim("[i]")} Input${tabControls}`;
+		const tabControls = allExecs.length > 1 ? `  ${dim("[Tab]")} Switch` : "";
+		const canScroll = totalLines > maxOutputLines;
+		let controls: string;
+		if (exec.isComplete) {
+			// Completed: just show close (auto-exit input mode if it was active)
+			if (this.inputMode) this.inputMode = false;
+			controls = ` ${dim("[q/Esc]")} Close${tabControls}`;
+		} else if (this.inputMode) {
+			// Input mode: show how to exit and send
+			controls = ` ${dim("[Esc]")} Exit input  ${dim("[Enter]")} Send`;
+		} else {
+			const scrollCtrl = canScroll ? `  ${dim("[↑/↓]")} Scroll` : "";
+			const interruptCtrl = exec.interrupt ? `  ${dim("[x]")} Interrupt` : "";
+			const abortCtrl = exec.abortSession ? `  ${dim("[X]")} Abort` : "";
+			controls = ` ${dim("[q/Esc]")} Close${scrollCtrl}  ${dim("[i]")} Input${interruptCtrl}${abortCtrl}${tabControls}`;
+		}
 		lines.push(dim("│") + fitContent(controls, safeWidth - 2) + dim("│"));
 
 		// Input area (if in input mode)
@@ -454,7 +514,8 @@ class SubagentOverlay implements Component {
 	}
 
 	handleInput(data: string): void {
-		const exec = getSelectedExecution();
+		// Use same fallback logic as render() for consistent behavior
+		const exec = getSelectedExecution() || lastCompletedExecution;
 		
 		// If in input mode, forward to input component (except escape)
 		if (this.inputMode) {
@@ -479,6 +540,33 @@ class SubagentOverlay implements Component {
 		// Enter input mode
 		if (matchesKey(data, "i") && exec && !exec.isComplete) {
 			this.inputMode = true;
+			this.cachedLines = null;
+			this.tui.requestRender();
+			return;
+		}
+
+		// Interrupt current tool (e.g., stuck bash command) - agent continues
+		if (matchesKey(data, "x") && exec && !exec.isComplete && exec.interrupt) {
+			const execId = exec.id; // Capture ID to avoid race condition
+			exec.allOutput.push("[interrupting current tool...]");
+			exec.interrupt().catch((err) => {
+				const errorMsg = err instanceof Error ? err.message : String(err);
+				const currentExec = activeExecutions.get(execId);
+				if (currentExec) {
+					currentExec.allOutput.push(`[interrupt error: ${errorMsg}]`);
+				}
+				this.cachedLines = null;
+				this.tui.requestRender();
+			});
+			this.cachedLines = null;
+			this.tui.requestRender();
+			return;
+		}
+
+		// Abort entire subagent session
+		if (data === "X" && exec && !exec.isComplete && exec.abortSession) {
+			exec.allOutput.push("[aborting subagent session...]");
+			exec.abortSession();
 			this.cachedLines = null;
 			this.tui.requestRender();
 			return;
@@ -616,6 +704,7 @@ interface SingleResult {
 interface Details {
 	mode: "single" | "parallel" | "chain";
 	results: SingleResult[];
+	stepsTotal?: number; // Total steps in chain/parallel (for progress display)
 	asyncId?: string;
 	asyncDir?: string;
 	progress?: AgentProgress[];
@@ -998,6 +1087,8 @@ interface RunSyncOptions {
 	chainTotal?: number;
 	parallelIndex?: number;
 	parallelTotal?: number;
+	// Initial output lines to show (e.g., chain handoff info)
+	initialOutput?: string[];
 }
 
 async function runSync(
@@ -1007,7 +1098,7 @@ async function runSync(
 	task: string,
 	options: RunSyncOptions,
 ): Promise<SingleResult> {
-	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, authStorage, modelRegistry, inheritMessages, mode, chainStep, chainTotal, parallelIndex, parallelTotal } = options;
+	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, authStorage, modelRegistry, inheritMessages, mode, chainStep, chainTotal, parallelIndex, parallelTotal, initialOutput } = options;
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		return {
@@ -1037,6 +1128,8 @@ async function runSync(
 		recentOutput: [],
 		toolCount: 0,
 		tokens: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
 		durationMs: 0,
 	};
 	result.progress = progress;
@@ -1058,7 +1151,7 @@ async function runSync(
 		parallelIndex,
 		parallelTotal,
 		progress,
-		allOutput: [],
+		allOutput: initialOutput ? [...initialOutput] : [],
 		isComplete: false,
 		startTime,
 	};
@@ -1079,6 +1172,19 @@ async function runSync(
 		}
 	}
 
+	// Create abort controller for this session (allows overlay to kill entire subagent)
+	const sessionAbortController = new AbortController();
+	
+	// Combine parent signal with our session abort controller
+	const combinedSignal = signal 
+		? AbortSignal.any([signal, sessionAbortController.signal])
+		: sessionAbortController.signal;
+	
+	// Store abort function for overlay
+	updateActiveExecution(executionId, { 
+		abortSession: () => sessionAbortController.abort() 
+	});
+
 	// Run via SDK
 	const sdkResult = await runAgentSDK({
 		agent,
@@ -1086,17 +1192,27 @@ async function runSync(
 		cwd: cwd ?? runtimeCwd,
 		authStorage,
 		modelRegistry,
-		signal,
+		signal: combinedSignal,
 		inheritMessages,
 		// Expose the steer function for overlay input
 		onSessionReady: (steer) => {
 			updateActiveExecution(executionId, { steer });
+		},
+		// Expose the interrupt function for cancelling current tool (agent continues)
+		onInterruptReady: (interrupt) => {
+			updateActiveExecution(executionId, { interrupt });
+		},
+		// Stream bash output to overlay (replaces previous preview)
+		onBashOutput: (lines) => {
+			updateBashPreview(executionId, lines);
 		},
 		onProgress: (sdkProgress) => {
 			const now = Date.now();
 			progress.durationMs = now - startTime;
 			progress.toolCount = sdkProgress.toolCount;
 			progress.tokens = sdkProgress.tokens;
+			progress.cacheRead = sdkProgress.cacheRead;
+			progress.cacheWrite = sdkProgress.cacheWrite;
 
 			// Track tool start/end for recentTools
 			if (sdkProgress.currentTool) {
@@ -1113,9 +1229,16 @@ async function runSync(
 					if (progress.recentTools.length > 5) {
 						progress.recentTools.pop();
 					}
+					
+					// Log tool call to overlay output for transparency
+					const toolLine = sdkProgress.currentToolArgs
+						? `▶ ${sdkProgress.currentTool}: ${sdkProgress.currentToolArgs}`
+						: `▶ ${sdkProgress.currentTool}`;
+					appendOutputLines(executionId, [toolLine]);
 				}
 			} else if (progress.currentTool) {
-				// Tool ended - update endMs for the current tool
+				// Tool ended - clear bash preview and update endMs
+				clearBashPreview(executionId);
 				const currentToolEntry = progress.recentTools.find((t) => t.tool === progress.currentTool && t.endMs === 0);
 				if (currentToolEntry) {
 					currentToolEntry.endMs = now;
@@ -1183,7 +1306,8 @@ async function runSync(
 	progress.status = result.exitCode === 0 ? "completed" : "failed";
 	progress.durationMs = Date.now() - startTime;
 	// toolCount is already tracked via onProgress callbacks, don't reset it
-	progress.tokens = sdkResult.usage.input + sdkResult.usage.output;
+	// Total tokens = all four components (matches Anthropic's totalTokens calculation)
+	progress.tokens = sdkResult.usage.input + sdkResult.usage.output + sdkResult.usage.cacheRead + sdkResult.usage.cacheWrite;
 	if (result.error) {
 		progress.error = result.error;
 		if (progress.currentTool) {
@@ -1249,14 +1373,18 @@ async function runSync(
 		error: result.error,
 		progress,
 		steer: undefined, // Clear steer function - session is disposed
+		interrupt: undefined, // Clear interrupt function - session is disposed
+		abortSession: undefined, // Clear abort function - session is disposed
 	});
 	
-	// For non-parallel mode, auto-clear after delay
-	// For parallel mode, let the parallel handler clear all at once when done
-	if (mode !== "parallel") {
+	// For single mode only, auto-clear after delay
+	// For chain/parallel modes, let clearCompletedExecutions handle cleanup at the end
+	if (mode === "single" || !mode) {
 		setTimeout(() => {
 			const exec = activeExecutions.get(executionId);
 			if (exec?.isComplete) {
+				// Save for seamless transitions before deleting
+				lastCompletedExecution = { ...exec };
 				activeExecutions.delete(executionId);
 				if (selectedExecutionId === executionId) {
 					selectedExecutionId = null;
@@ -1628,10 +1756,27 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			if (hasChain && params.chain) {
 				const results: SingleResult[] = [];
 				let prev = "";
+				let chainHandoff: { fromStep: number; preview: string } | null = null;
 				try {
 					for (let i = 0; i < params.chain.length; i++) {
 						const step = params.chain[i];
 						const taskWithPrev = step.task.replace(/\{previous\}/g, prev);
+						
+						// Build initial output with handoff info from previous step
+						let stepInitialOutput: string[] | undefined;
+						if (chainHandoff && i > 0) {
+							const allPreviewLines = chainHandoff.preview.split("\n");
+							const previewLines = allPreviewLines.slice(0, 10);
+							const moreLines = allPreviewLines.length - 10;
+							stepInitialOutput = [
+								`━━━ Received from step ${chainHandoff.fromStep} ━━━`,
+								...previewLines.map(l => `  ${l}`),
+								...(moreLines > 0 ? [`  ... (${moreLines} more lines)`] : []),
+								`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+								``,
+							];
+						}
+						
 						const r = await runSync(ctx.cwd, agents, step.agent, taskWithPrev, {
 							cwd: step.cwd ?? params.cwd,
 							signal,
@@ -1649,12 +1794,15 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 							mode: "chain",
 							chainStep: i,
 							chainTotal: params.chain.length,
+							// Show handoff info from previous step
+							initialOutput: stepInitialOutput,
 							onUpdate: onUpdate
 								? (p) =>
 										onUpdate({
 											...p,
 											details: {
 												mode: "chain",
+												stepsTotal: params.chain.length,
 												results: [...results, ...(p.details?.results || [])],
 												progress: [...allProgress, ...(p.details?.progress || [])],
 											},
@@ -1671,6 +1819,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 								content: [{ type: "text", text: r.error || "Chain failed" }],
 								details: {
 									mode: "chain",
+									stepsTotal: params.chain.length,
 									results,
 									progress: params.includeProgress ? allProgress : undefined,
 									artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
@@ -1679,6 +1828,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 							};
 						}
 						prev = getFinalOutput(r.messages);
+						
+						// Store handoff info for next step to display
+						if (i < params.chain.length - 1) {
+							chainHandoff = {
+								fromStep: i + 1,
+								preview: prev.length > 300 ? prev.slice(0, 297) + "..." : prev,
+							};
+						}
 					}
 
 					// Clear execution tracking on chain success
@@ -1700,6 +1857,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						content: [{ type: "text", text: finalOutput || "(no output)" }],
 						details: {
 							mode: "chain",
+							stepsTotal: params.chain.length,
 							results,
 							progress: params.includeProgress ? allProgress : undefined,
 							artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
@@ -1756,6 +1914,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						content: [{ type: "text", text: `${ok}/${results.length} succeeded${downgradeNote}` }],
 						details: {
 							mode: "parallel",
+							stepsTotal: parallelTotal,
 							results,
 							progress: params.includeProgress ? allProgress : undefined,
 							artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
@@ -1960,7 +2119,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					: "";
 
 			const modeLabel = d.mode === "parallel" ? "parallel (no live progress)" : d.mode;
-			const stepInfo = hasRunning ? ` ${ok + 1}/${d.results.length}` : ` ${ok}/${d.results.length}`;
+			const totalSteps = d.stepsTotal || d.results.length;
+			const stepInfo = hasRunning ? ` ${ok + 1}/${totalSteps}` : ` ${ok}/${totalSteps}`;
 
 			if (expanded) {
 				const c = new Container();
@@ -2215,7 +2375,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.registerShortcut("ctrl+shift+o", {
 		description: "Open subagent execution overlay",
 		async handler(ctx) {
-			if (activeExecutions.size === 0) {
+			// Allow opening overlay if we have active executions OR a recent completed one
+			if (activeExecutions.size === 0 && !lastCompletedExecution) {
 				if (ctx.hasUI) {
 					ctx.ui.notify("No active subagent execution", "info");
 				}

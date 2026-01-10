@@ -26,6 +26,8 @@ export interface SDKProgress {
 	currentToolArgs?: string;
 	toolCount: number;
 	tokens: number;
+	cacheRead: number;
+	cacheWrite: number;
 	turns: number;
 }
 
@@ -58,6 +60,17 @@ export interface SDKRunnerOptions {
 	 * Use this to inject steering messages into the running subagent.
 	 */
 	onSessionReady?: (steer: (message: string) => Promise<void>) => void;
+	/**
+	 * Called with streaming bash output (last N lines).
+	 * Use this to show real-time bash command output.
+	 */
+	onBashOutput?: (lines: string[]) => void;
+	/**
+	 * Called when session is ready, providing the interrupt function.
+	 * Use this to cancel the current operation (e.g., stuck bash command).
+	 * The agent will continue after receiving the aborted result.
+	 */
+	onInterruptReady?: (interrupt: () => Promise<void>) => void;
 }
 
 export interface SDKRunnerResult {
@@ -79,7 +92,7 @@ export interface SDKRunnerResult {
  * - Better integration: Direct access to session events and messages
  */
 export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerResult> {
-	const { agent, task, cwd, authStorage, modelRegistry, signal, onProgress, onMessage, inheritMessages, onSessionReady } = options;
+	const { agent, task, cwd, authStorage, modelRegistry, signal, onProgress, onMessage, inheritMessages, onSessionReady, onBashOutput, onInterruptReady } = options;
 
 	const usage: Usage = {
 		input: 0,
@@ -93,6 +106,8 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 	const progress: SDKProgress = {
 		toolCount: 0,
 		tokens: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
 		turns: 0,
 	};
 
@@ -183,6 +198,11 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 			onSessionReady(session.steer.bind(session));
 		}
 
+		// Expose the interrupt function for cancelling stuck operations
+		if (onInterruptReady) {
+			onInterruptReady(session.abort.bind(session));
+		}
+
 		// Subscribe to events for progress tracking
 		const unsubscribe = session.subscribe((event) => {
 			switch (event.type) {
@@ -197,6 +217,20 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 					progress.currentTool = undefined;
 					progress.currentToolArgs = undefined;
 					onProgress?.(progress);
+					break;
+
+				case "tool_execution_update":
+					// Stream bash output for real-time visibility
+					if (onBashOutput && event.toolName === "bash") {
+						const text = event.partialResult?.content?.[0]?.text;
+						if (text && typeof text === "string") {
+							// Get last 5 non-empty lines for compact preview
+							const lines = text.split("\n").filter((l: string) => l.trim()).slice(-5);
+							if (lines.length > 0) {
+								onBashOutput(lines);
+							}
+						}
+					}
 					break;
 
 				case "message_end":
@@ -219,7 +253,10 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 								usage.cacheRead += u.cacheRead || 0;
 								usage.cacheWrite += u.cacheWrite || 0;
 								usage.cost += u.cost?.total || 0;
-								progress.tokens = usage.input + usage.output;
+								// Total tokens = all four components (matches Anthropic's totalTokens calculation)
+								progress.tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+								progress.cacheRead = usage.cacheRead;
+								progress.cacheWrite = usage.cacheWrite;
 							}
 						}
 					}
