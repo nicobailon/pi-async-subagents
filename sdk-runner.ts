@@ -53,6 +53,11 @@ export interface SDKRunnerOptions {
 	 * before executing its task.
 	 */
 	inheritMessages?: AgentMessage[];
+	/**
+	 * Called when session is ready, providing the steer function.
+	 * Use this to inject steering messages into the running subagent.
+	 */
+	onSessionReady?: (steer: (message: string) => Promise<void>) => void;
 }
 
 export interface SDKRunnerResult {
@@ -74,7 +79,7 @@ export interface SDKRunnerResult {
  * - Better integration: Direct access to session events and messages
  */
 export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerResult> {
-	const { agent, task, cwd, authStorage, modelRegistry, signal, onProgress, onMessage, inheritMessages } = options;
+	const { agent, task, cwd, authStorage, modelRegistry, signal, onProgress, onMessage, inheritMessages, onSessionReady } = options;
 
 	const usage: Usage = {
 		input: 0,
@@ -173,6 +178,11 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 			session.agent.replaceMessages(inheritMessages);
 		}
 
+		// Expose the steer function for external steering (e.g., from overlay input)
+		if (onSessionReady) {
+			onSessionReady(session.steer.bind(session));
+		}
+
 		// Subscribe to events for progress tracking
 		const unsubscribe = session.subscribe((event) => {
 			switch (event.type) {
@@ -221,10 +231,9 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 		});
 
 		// Handle abort signal
-		if (signal) {
-			signal.addEventListener("abort", () => {
-				session.abort();
-			}, { once: true });
+		const abortHandler = signal ? () => session.abort() : undefined;
+		if (signal && abortHandler) {
+			signal.addEventListener("abort", abortHandler, { once: true });
 		}
 
 		try {
@@ -238,7 +247,10 @@ export async function runAgentSDK(options: SDKRunnerOptions): Promise<SDKRunnerR
 				exitCode: 0,
 			};
 		} finally {
-			// Always cleanup
+			// Always cleanup - remove abort listener to prevent calling abort on disposed session
+			if (signal && abortHandler) {
+				signal.removeEventListener("abort", abortHandler);
+			}
 			unsubscribe();
 			session.dispose();
 		}

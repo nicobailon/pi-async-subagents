@@ -70,39 +70,109 @@ interface ActiveExecution {
 	mode: "single" | "chain" | "parallel";
 	chainStep?: number;
 	chainTotal?: number;
+	parallelIndex?: number; // Index in parallel tasks (0-based)
+	parallelTotal?: number; // Total parallel tasks
 	progress: AgentProgress;
 	allOutput: string[]; // Accumulates ALL output lines for scrolling
 	isComplete: boolean;
 	error?: string;
 	startTime: number;
+	/** Steer function to inject messages into the running subagent */
+	steer?: (message: string) => Promise<void>;
 }
 
-let activeExecution: ActiveExecution | null = null;
+// Track multiple executions (for parallel mode)
+const activeExecutions = new Map<string, ActiveExecution>();
+let selectedExecutionId: string | null = null;
 let overlayUpdateCallback: (() => void) | null = null;
 
+// Helper to get the currently selected execution (or first one if none selected)
+function getSelectedExecution(): ActiveExecution | null {
+	if (activeExecutions.size === 0) return null;
+	if (selectedExecutionId && activeExecutions.has(selectedExecutionId)) {
+		return activeExecutions.get(selectedExecutionId)!;
+	}
+	// Default to first execution
+	const first = activeExecutions.values().next().value;
+	if (first) selectedExecutionId = first.id;
+	return first || null;
+}
+
 function setActiveExecution(exec: ActiveExecution | null): void {
-	activeExecution = exec;
+	if (exec === null) {
+		// Clear all executions
+		activeExecutions.clear();
+		selectedExecutionId = null;
+	} else {
+		// Add or replace execution
+		activeExecutions.set(exec.id, exec);
+		// Auto-select if this is the only one or none selected
+		if (activeExecutions.size === 1 || !selectedExecutionId) {
+			selectedExecutionId = exec.id;
+		}
+	}
+	overlayUpdateCallback?.();
+}
+
+function addExecution(exec: ActiveExecution): void {
+	activeExecutions.set(exec.id, exec);
+	// Auto-select first execution
+	if (activeExecutions.size === 1) {
+		selectedExecutionId = exec.id;
+	}
 	overlayUpdateCallback?.();
 }
 
 function updateActiveExecution(id: string, updates: Partial<ActiveExecution>): void {
-	// Only update if the ID matches (prevents race conditions)
-	if (activeExecution && activeExecution.id === id) {
-		Object.assign(activeExecution, updates);
+	const exec = activeExecutions.get(id);
+	if (exec) {
+		Object.assign(exec, updates);
 		overlayUpdateCallback?.();
 	}
 }
 
 function appendOutputLines(id: string, lines: string[]): void {
-	// Only append if the ID matches
-	if (activeExecution && activeExecution.id === id) {
-		activeExecution.allOutput.push(...lines);
+	const exec = activeExecutions.get(id);
+	if (exec) {
+		exec.allOutput.push(...lines);
 		// Keep a reasonable limit to prevent memory issues
-		if (activeExecution.allOutput.length > 1000) {
-			activeExecution.allOutput = activeExecution.allOutput.slice(-1000);
+		if (exec.allOutput.length > 1000) {
+			exec.allOutput = exec.allOutput.slice(-1000);
 		}
 		overlayUpdateCallback?.();
 	}
+}
+
+function selectExecution(id: string): void {
+	if (activeExecutions.has(id)) {
+		selectedExecutionId = id;
+		overlayUpdateCallback?.();
+	}
+}
+
+function selectNextExecution(): void {
+	if (activeExecutions.size <= 1) return;
+	const ids = Array.from(activeExecutions.keys());
+	const currentIdx = selectedExecutionId ? ids.indexOf(selectedExecutionId) : -1;
+	const nextIdx = (currentIdx + 1) % ids.length;
+	selectedExecutionId = ids[nextIdx];
+	overlayUpdateCallback?.();
+}
+
+function selectPrevExecution(): void {
+	if (activeExecutions.size <= 1) return;
+	const ids = Array.from(activeExecutions.keys());
+	const currentIdx = selectedExecutionId ? ids.indexOf(selectedExecutionId) : 0;
+	const prevIdx = (currentIdx - 1 + ids.length) % ids.length;
+	selectedExecutionId = ids[prevIdx];
+	overlayUpdateCallback?.();
+}
+
+function clearCompletedExecutions(): void {
+	// Clear all executions when done
+	activeExecutions.clear();
+	selectedExecutionId = null;
+	overlayUpdateCallback?.();
 }
 
 /**
@@ -124,18 +194,47 @@ class SubagentOverlay implements Component {
 	constructor(tui: TUI, done: () => void) {
 		this.tui = tui;
 		this.done = done;
-		// Full width minus small margin
-		this.width = Math.max(60, (process.stdout.columns || 120) - 4);
+		// Reasonable overlay width - not too large, max 100 columns
+		this.width = Math.min(100, Math.max(60, Math.floor((process.stdout.columns || 100) * 0.7)));
 		
 		// Create input component for optional user prompts
 		this.input = new Input();
 		this.input.onSubmit = (value) => {
-			if (value.trim() && activeExecution && !activeExecution.isComplete) {
-				// TODO: Send prompt to subagent (requires SDK support)
-				// For now, just show that input was received
-				activeExecution.allOutput.push(`> ${value}`);
+			const exec = getSelectedExecution();
+			if (value.trim() && exec && !exec.isComplete) {
+				// Capture execution ID to ensure error goes to correct execution
+				const execId = exec.id;
+				
+				// Show the input in output
+				exec.allOutput.push(`> ${value}`);
+				
+				// Actually steer the subagent if steer function is available
+				if (exec.steer) {
+					try {
+						exec.steer(value).catch((err) => {
+							const errorMsg = err instanceof Error ? err.message : String(err);
+							// Only push error to the same execution that initiated the steer
+							const currentExec = activeExecutions.get(execId);
+							if (currentExec) {
+								currentExec.allOutput.push(`[steer error: ${errorMsg}]`);
+							}
+							this.cachedLines = null;
+							this.tui.requestRender(); // Trigger re-render to show error
+						});
+					} catch (syncErr) {
+						// Handle synchronous errors (e.g., if steer throws before returning Promise)
+						const errorMsg = syncErr instanceof Error ? syncErr.message : String(syncErr);
+						exec.allOutput.push(`[steer error: ${errorMsg}]`);
+						// Note: re-render will happen below via the common path
+					}
+				} else {
+					// Steer function not yet available (session still initializing)
+					exec.allOutput.push(`[steering not available yet]`);
+				}
+				
 				this.input.setValue("");
 				this.inputMode = false; // Exit input mode after submit
+				this.scrollOffset = 0; // Auto-scroll to show new content
 				this.cachedLines = null;
 				this.tui.requestRender();
 			}
@@ -171,7 +270,9 @@ class SubagentOverlay implements Component {
 		}
 
 		const termHeight = process.stdout.rows || 40;
-		const maxOutputLines = Math.max(1, termHeight - 12); // Reserve space for header, footer, input
+		// Cap output area to reasonable size (max 20 lines) to prevent overlay from being too tall
+		// Reserve ~15 lines for header, tabs, task, tool, footer, input, error, scroll indicator
+		const maxOutputLines = Math.min(20, Math.max(5, termHeight - 18));
 		const lines: string[] = [];
 		
 		// ANSI color helpers
@@ -192,54 +293,91 @@ class SubagentOverlay implements Component {
 		// Ensure minimum width for rendering
 		const safeWidth = Math.max(20, width);
 		
+		// Helper to truncate and pad content to fit within box (defined early for use throughout)
+		const fitContent = (content: string, maxWidth: number) => {
+			const truncated = truncateToWidth(content, maxWidth);
+			return padVisible(truncated, maxWidth);
+		};
+		
 		// Top border
 		const horizLine = "─".repeat(safeWidth - 2);
 		lines.push(dim(`┌${horizLine}┐`));
 
-		if (!activeExecution) {
-			lines.push(dim("│") + " No active subagent execution.".padEnd(safeWidth - 2) + dim("│"));
+		// Get all executions for multi-agent support
+		const allExecs = Array.from(activeExecutions.values());
+		const exec = getSelectedExecution();
+
+		if (!exec || allExecs.length === 0) {
+			const noExecMsg = " No active subagent execution.";
+			lines.push(dim("│") + fitContent(noExecMsg, safeWidth - 2) + dim("│"));
 			lines.push(dim(`└${horizLine}┘`));
 			this.cachedLines = lines;
 			return lines;
 		}
 
-		const exec = activeExecution;
+		// Multi-agent tabs (only show if multiple executions)
+		if (allExecs.length > 1) {
+			const selectedIdx = allExecs.findIndex(e => e.id === selectedExecutionId);
+			const tabParts: string[] = [];
+			for (let i = 0; i < allExecs.length; i++) {
+				const e = allExecs[i];
+				const icon = e.isComplete
+					? (e.error ? red("✗") : green("✓"))
+					: yellow("◐");
+				const num = i + 1;
+				const isSelected = i === selectedIdx;
+				const label = isSelected
+					? `[${bold(String(num))}] ${icon} ${bold(e.agent)}`
+					: `[${num}] ${icon} ${e.agent}`;
+				tabParts.push(isSelected ? label : dim(label));
+			}
+			const tabLine = ` ${tabParts.join("  ")}`;
+			lines.push(dim("│") + fitContent(tabLine, safeWidth - 2) + dim("│"));
+			lines.push(dim(`├${horizLine}┤`));
+		}
+
 		const elapsed = Date.now() - exec.startTime;
 		const elapsedStr = formatDuration(elapsed);
 
 		// Header with status
 		const modeLabel = exec.mode === "chain" && exec.chainStep !== undefined
 			? `chain ${exec.chainStep + 1}/${exec.chainTotal}`
-			: exec.mode;
+			: exec.mode === "parallel" && exec.parallelIndex !== undefined
+				? `parallel ${exec.parallelIndex + 1}/${exec.parallelTotal}`
+				: exec.mode;
 		const statusIcon = exec.isComplete
 			? (exec.error ? red("✗") : green("✓"))
 			: yellow("◐");
-		const headerText = ` ${statusIcon} ${bold(exec.agent)} ${dim(`(${modeLabel})`)} │ ${exec.progress.toolCount} tools │ ${formatTokens(exec.progress.tokens)} tok │ ${elapsedStr} `;
-		lines.push(dim("│") + padVisible(headerText, safeWidth - 2) + dim("│"));
+		
+		const headerText = ` ${statusIcon} ${bold(exec.agent)} ${dim(`(${modeLabel})`)} │ ${exec.progress.toolCount} tools │ ${formatTokens(exec.progress.tokens)} tok │ ${elapsedStr}`;
+		lines.push(dim("│") + fitContent(headerText, safeWidth - 2) + dim("│"));
 
 		// Separator
 		lines.push(dim(`├${horizLine}┤`));
 
-		// Task (truncated if needed)
-		const taskMaxLen = Math.max(10, safeWidth - 10);
-		const taskText = exec.task.length > taskMaxLen ? exec.task.slice(0, Math.max(0, taskMaxLen - 3)) + "..." : exec.task;
-		lines.push(dim("│") + padVisible(` ${dim("Task:")} ${taskText}`, safeWidth - 2) + dim("│"));
+		// Task (truncated to fit in box)
+		const taskPrefix = ` ${dim("Task:")} `;
+		const taskMaxWidth = safeWidth - 2 - visibleWidth(taskPrefix);
+		const taskText = truncateToWidth(exec.task, Math.max(10, taskMaxWidth));
+		lines.push(dim("│") + fitContent(taskPrefix + taskText, safeWidth - 2) + dim("│"));
 
-		// Current tool (if running)
+		// Current tool / status line (always show for consistent height)
 		if (exec.progress.currentTool && !exec.isComplete) {
-			const toolMaxLen = Math.max(20, safeWidth - 12);
-			const toolArgs = exec.progress.currentToolArgs || "";
-			const argsSpace = Math.max(0, toolMaxLen - exec.progress.currentTool.length - 5);
-			const toolText = toolArgs.length > argsSpace
-				? `${exec.progress.currentTool}: ${toolArgs.slice(0, argsSpace)}...`
-				: `${exec.progress.currentTool}: ${toolArgs}`;
-			lines.push(dim("│") + padVisible(` ${cyan("▶")} ${toolText}`, safeWidth - 2) + dim("│"));
+			const toolPrefix = ` ${cyan("▶")} ${exec.progress.currentTool}: `;
+			const toolMaxWidth = safeWidth - 2 - visibleWidth(toolPrefix);
+			const toolArgs = truncateToWidth(exec.progress.currentToolArgs || "", Math.max(10, toolMaxWidth));
+			lines.push(dim("│") + fitContent(toolPrefix + toolArgs, safeWidth - 2) + dim("│"));
+		} else if (exec.isComplete) {
+			const statusText = exec.error ? ` ${red("✗")} Completed with error` : ` ${green("✓")} Completed`;
+			lines.push(dim("│") + fitContent(statusText, safeWidth - 2) + dim("│"));
+		} else {
+			lines.push(dim("│") + fitContent(` ${yellow("◐")} Waiting...`, safeWidth - 2) + dim("│"));
 		}
 
 		// Output section header
 		lines.push(dim(`├${horizLine}┤`));
-		const outputLabel = ` Output ${dim(`(${exec.allOutput.length} lines)`)} `;
-		lines.push(dim("│") + padVisible(outputLabel, safeWidth - 2) + dim("│"));
+		const outputLabel = ` Output ${dim(`(${exec.allOutput.length} lines)`)}`;
+		lines.push(dim("│") + fitContent(outputLabel, safeWidth - 2) + dim("│"));
 		lines.push(dim(`├${horizLine}┤`));
 
 		// Output lines (scrollable)
@@ -261,35 +399,42 @@ class SubagentOverlay implements Component {
 				lines.push(dim("│") + " ".repeat(safeWidth - 2) + dim("│"));
 			}
 
-			// Scroll indicator
+			// Scroll indicator (always show section for consistent height)
+			lines.push(dim(`├${horizLine}┤`));
 			if (this.scrollOffset > 0 || startIdx > 0) {
 				const upArrow = startIdx > 0 ? `↑${startIdx}` : "";
 				const downArrow = this.scrollOffset > 0 ? `↓${this.scrollOffset}` : "";
 				const scrollText = [upArrow, downArrow].filter(Boolean).join(" │ ");
-				lines.push(dim(`├${horizLine}┤`));
-				lines.push(dim("│") + padVisible(` ${dim(scrollText)}`, safeWidth - 2) + dim("│"));
+				lines.push(dim("│") + fitContent(` ${dim(scrollText)}`, safeWidth - 2) + dim("│"));
+			} else {
+				lines.push(dim("│") + " ".repeat(safeWidth - 2) + dim("│"));
 			}
 		} else {
-			lines.push(dim("│") + padVisible(dim(" (waiting for output...)"), safeWidth - 2) + dim("│"));
+			lines.push(dim("│") + fitContent(dim(" (waiting for output...)"), safeWidth - 2) + dim("│"));
 			for (let i = 1; i < maxOutputLines; i++) {
 				lines.push(dim("│") + " ".repeat(safeWidth - 2) + dim("│"));
 			}
+			// Scroll indicator placeholder for consistent height
+			lines.push(dim(`├${horizLine}┤`));
+			lines.push(dim("│") + " ".repeat(safeWidth - 2) + dim("│"));
 		}
 
 		// Error if any
 		if (exec.error) {
 			lines.push(dim(`├${horizLine}┤`));
-			const errMaxLen = Math.max(10, safeWidth - 15);
-			const errText = ` ${red("Error:")} ${exec.error.slice(0, errMaxLen)}`;
-			lines.push(dim("│") + padVisible(errText, safeWidth - 2) + dim("│"));
+			const errPrefix = ` ${red("Error:")} `;
+			const errMaxWidth = safeWidth - 2 - visibleWidth(errPrefix);
+			const errText = truncateToWidth(exec.error, Math.max(10, errMaxWidth));
+			lines.push(dim("│") + fitContent(errPrefix + errText, safeWidth - 2) + dim("│"));
 		}
 
 		// Footer with controls
 		lines.push(dim(`├${horizLine}┤`));
+		const tabControls = allExecs.length > 1 ? `  ${dim("[Tab]")} Switch agent  ${dim("[1-9]")} Select` : "";
 		const controls = exec.isComplete
-			? `${dim("[q/Esc]")} Close`
-			: `${dim("[q/Esc]")} Close  ${dim("[↑/↓]")} Scroll  ${dim("[i]")} Input`;
-		lines.push(dim("│") + padVisible(` ${controls}`, safeWidth - 2) + dim("│"));
+			? ` ${dim("[q/Esc]")} Close${tabControls}`
+			: ` ${dim("[q/Esc]")} Close  ${dim("[↑/↓]")} Scroll  ${dim("[i]")} Input${tabControls}`;
+		lines.push(dim("│") + fitContent(controls, safeWidth - 2) + dim("│"));
 
 		// Input area (if in input mode)
 		if (this.inputMode && !exec.isComplete) {
@@ -297,8 +442,8 @@ class SubagentOverlay implements Component {
 			// Input component already renders with "> " prompt and cursor
 			const inputLines = this.input.render(Math.max(10, safeWidth - 4));
 			const inputText = inputLines[0] || "> ";
-			// Use padVisible since input may have ANSI codes for cursor
-			lines.push(dim("│") + " " + padVisible(inputText, safeWidth - 4) + dim("│"));
+			// Truncate and pad to ensure it fits within box
+			lines.push(dim("│") + fitContent(" " + inputText, safeWidth - 2) + dim("│"));
 		}
 
 		// Bottom border
@@ -309,6 +454,8 @@ class SubagentOverlay implements Component {
 	}
 
 	handleInput(data: string): void {
+		const exec = getSelectedExecution();
+		
 		// If in input mode, forward to input component (except escape)
 		if (this.inputMode) {
 			if (matchesKey(data, "escape")) {
@@ -330,16 +477,48 @@ class SubagentOverlay implements Component {
 		}
 
 		// Enter input mode
-		if (matchesKey(data, "i") && activeExecution && !activeExecution.isComplete) {
+		if (matchesKey(data, "i") && exec && !exec.isComplete) {
 			this.inputMode = true;
 			this.cachedLines = null;
 			this.tui.requestRender();
 			return;
 		}
 
-		const totalLines = activeExecution?.allOutput.length ?? 0;
+		// Multi-agent navigation
+		if (activeExecutions.size > 1) {
+			// Tab to switch to next agent
+			if (matchesKey(data, "tab")) {
+				selectNextExecution();
+				this.scrollOffset = 0; // Reset scroll when switching
+				this.cachedLines = null;
+				this.tui.requestRender();
+				return;
+			}
+			// Shift+Tab to switch to previous agent
+			if (data === "\x1b[Z") { // Shift+Tab escape sequence
+				selectPrevExecution();
+				this.scrollOffset = 0;
+				this.cachedLines = null;
+				this.tui.requestRender();
+				return;
+			}
+			// Number keys 1-9 to select specific agent
+			if (data >= "1" && data <= "9") {
+				const idx = parseInt(data, 10) - 1;
+				const allExecs = Array.from(activeExecutions.values());
+				if (idx < allExecs.length) {
+					selectExecution(allExecs[idx].id);
+					this.scrollOffset = 0;
+					this.cachedLines = null;
+					this.tui.requestRender();
+				}
+				return;
+			}
+		}
+
+		const totalLines = exec?.allOutput.length ?? 0;
 		const termHeight = process.stdout.rows || 40;
-		const maxOutputLines = Math.max(1, termHeight - 12); // Same calculation as render()
+		const maxOutputLines = Math.min(20, Math.max(5, termHeight - 18)); // Same calculation as render()
 		const maxScroll = Math.max(0, totalLines - maxOutputLines);
 
 		// Scrolling - line by line
@@ -817,6 +996,8 @@ interface RunSyncOptions {
 	mode?: "single" | "chain" | "parallel";
 	chainStep?: number;
 	chainTotal?: number;
+	parallelIndex?: number;
+	parallelTotal?: number;
 }
 
 async function runSync(
@@ -826,7 +1007,7 @@ async function runSync(
 	task: string,
 	options: RunSyncOptions,
 ): Promise<SingleResult> {
-	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, authStorage, modelRegistry, inheritMessages, mode, chainStep, chainTotal } = options;
+	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, authStorage, modelRegistry, inheritMessages, mode, chainStep, chainTotal, parallelIndex, parallelTotal } = options;
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		return {
@@ -865,20 +1046,27 @@ async function runSync(
 	// Generate unique execution ID for tracking (prevents race conditions in chains)
 	const executionId = `${runId}-${index ?? 0}-${Date.now()}`;
 
-	// Set active execution for overlay tracking (only if not parallel mode - parallel updates separately)
-	if (mode !== "parallel") {
-		setActiveExecution({
-			id: executionId,
-			agent: agentName,
-			task,
-			mode: mode ?? "single",
-			chainStep,
-			chainTotal,
-			progress,
-			allOutput: [],
-			isComplete: false,
-			startTime,
-		});
+	// Set active execution for overlay tracking
+	// For parallel mode, use addExecution to support multiple; for others, use setActiveExecution
+	const execData: ActiveExecution = {
+		id: executionId,
+		agent: agentName,
+		task,
+		mode: mode ?? "single",
+		chainStep,
+		chainTotal,
+		parallelIndex,
+		parallelTotal,
+		progress,
+		allOutput: [],
+		isComplete: false,
+		startTime,
+	};
+	
+	if (mode === "parallel") {
+		addExecution(execData);
+	} else {
+		setActiveExecution(execData);
 	}
 
 	// Setup artifacts
@@ -900,6 +1088,10 @@ async function runSync(
 		modelRegistry,
 		signal,
 		inheritMessages,
+		// Expose the steer function for overlay input
+		onSessionReady: (steer) => {
+			updateActiveExecution(executionId, { steer });
+		},
 		onProgress: (sdkProgress) => {
 			const now = Date.now();
 			progress.durationMs = now - startTime;
@@ -933,9 +1125,7 @@ async function runSync(
 			}
 
 			// Update active execution for overlay
-			if (mode !== "parallel") {
-				updateActiveExecution(executionId, { progress });
-			}
+			updateActiveExecution(executionId, { progress });
 
 			if (onUpdate) {
 				onUpdate({
@@ -958,9 +1148,7 @@ async function runSync(
 					progress.recentOutput = lines.slice(-8);
 
 					// Append ALL lines to overlay's scrollable history
-					if (mode !== "parallel") {
-						appendOutputLines(executionId, lines);
-					}
+					appendOutputLines(executionId, lines);
 				}
 			}
 
@@ -1056,17 +1244,24 @@ async function runSync(
 	}
 
 	// Mark execution complete (for overlay) but don't clear yet - let overlay show final state
+	updateActiveExecution(executionId, {
+		isComplete: true,
+		error: result.error,
+		progress,
+		steer: undefined, // Clear steer function - session is disposed
+	});
+	
+	// For non-parallel mode, auto-clear after delay
+	// For parallel mode, let the parallel handler clear all at once when done
 	if (mode !== "parallel") {
-		updateActiveExecution(executionId, {
-			isComplete: true,
-			error: result.error,
-			progress,
-		});
-		// Clear after a short delay to allow overlay to show completion
-		// Use execution ID to ensure we only clear THIS execution, not a subsequent one
 		setTimeout(() => {
-			if (activeExecution?.id === executionId && activeExecution?.isComplete) {
-				setActiveExecution(null);
+			const exec = activeExecutions.get(executionId);
+			if (exec?.isComplete) {
+				activeExecutions.delete(executionId);
+				if (selectedExecutionId === executionId) {
+					selectedExecutionId = null;
+				}
+				overlayUpdateCallback?.();
 			}
 		}, 100);
 	}
@@ -1433,77 +1628,89 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			if (hasChain && params.chain) {
 				const results: SingleResult[] = [];
 				let prev = "";
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithPrev = step.task.replace(/\{previous\}/g, prev);
-					const r = await runSync(ctx.cwd, agents, step.agent, taskWithPrev, {
-						cwd: step.cwd ?? params.cwd,
-						signal,
-						runId,
-						index: i,
-						sessionDir: sessionDirForIndex(i),
-						share: shareEnabled,
-						artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
-						artifactConfig,
-						authStorage,
-						modelRegistry,
-						// Only first step in chain inherits parent context; subsequent steps get {previous}
-						inheritMessages: i === 0 ? inheritMessages : undefined,
-						// For overlay tracking
-						mode: "chain",
-						chainStep: i,
-						chainTotal: params.chain.length,
-						onUpdate: onUpdate
-							? (p) =>
-									onUpdate({
-										...p,
-										details: {
-											mode: "chain",
-											results: [...results, ...(p.details?.results || [])],
-											progress: [...allProgress, ...(p.details?.progress || [])],
-										},
-									})
-							: undefined,
-					});
-					results.push(r);
-					if (r.progress) allProgress.push(r.progress);
-					if (r.artifactPaths) allArtifactPaths.push(r.artifactPaths);
-					if (r.exitCode !== 0)
-						return {
-							content: [{ type: "text", text: r.error || "Chain failed" }],
-							details: {
-								mode: "chain",
-								results,
-								progress: params.includeProgress ? allProgress : undefined,
-								artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
-							},
-							isError: true,
-						};
-					prev = getFinalOutput(r.messages);
-				}
-
-				let finalOutput = prev;
-				let truncationInfo: Details["truncation"];
-				if (params.maxOutput) {
-					const config = { ...DEFAULT_MAX_OUTPUT, ...params.maxOutput };
-					const outputPath = allArtifactPaths[allArtifactPaths.length - 1]?.outputPath;
-					const truncResult = truncateOutput(prev, config, outputPath);
-					if (truncResult.truncated) {
-						finalOutput = truncResult.text;
-						truncationInfo = truncResult;
+				try {
+					for (let i = 0; i < params.chain.length; i++) {
+						const step = params.chain[i];
+						const taskWithPrev = step.task.replace(/\{previous\}/g, prev);
+						const r = await runSync(ctx.cwd, agents, step.agent, taskWithPrev, {
+							cwd: step.cwd ?? params.cwd,
+							signal,
+							runId,
+							index: i,
+							sessionDir: sessionDirForIndex(i),
+							share: shareEnabled,
+							artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
+							artifactConfig,
+							authStorage,
+							modelRegistry,
+							// Only first step in chain inherits parent context; subsequent steps get {previous}
+							inheritMessages: i === 0 ? inheritMessages : undefined,
+							// For overlay tracking
+							mode: "chain",
+							chainStep: i,
+							chainTotal: params.chain.length,
+							onUpdate: onUpdate
+								? (p) =>
+										onUpdate({
+											...p,
+											details: {
+												mode: "chain",
+												results: [...results, ...(p.details?.results || [])],
+												progress: [...allProgress, ...(p.details?.progress || [])],
+											},
+										})
+								: undefined,
+						});
+						results.push(r);
+						if (r.progress) allProgress.push(r.progress);
+						if (r.artifactPaths) allArtifactPaths.push(r.artifactPaths);
+						if (r.exitCode !== 0) {
+							// Clear execution tracking on chain failure
+							clearCompletedExecutions();
+							return {
+								content: [{ type: "text", text: r.error || "Chain failed" }],
+								details: {
+									mode: "chain",
+									results,
+									progress: params.includeProgress ? allProgress : undefined,
+									artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
+								},
+								isError: true,
+							};
+						}
+						prev = getFinalOutput(r.messages);
 					}
-				}
 
-				return {
-					content: [{ type: "text", text: finalOutput || "(no output)" }],
-					details: {
-						mode: "chain",
-						results,
-						progress: params.includeProgress ? allProgress : undefined,
-						artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
-						truncation: truncationInfo,
-					},
-				};
+					// Clear execution tracking on chain success
+					clearCompletedExecutions();
+
+					let finalOutput = prev;
+					let truncationInfo: Details["truncation"];
+					if (params.maxOutput) {
+						const config = { ...DEFAULT_MAX_OUTPUT, ...params.maxOutput };
+						const outputPath = allArtifactPaths[allArtifactPaths.length - 1]?.outputPath;
+						const truncResult = truncateOutput(prev, config, outputPath);
+						if (truncResult.truncated) {
+							finalOutput = truncResult.text;
+							truncationInfo = truncResult;
+						}
+					}
+
+					return {
+						content: [{ type: "text", text: finalOutput || "(no output)" }],
+						details: {
+							mode: "chain",
+							results,
+							progress: params.includeProgress ? allProgress : undefined,
+							artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
+							truncation: truncationInfo,
+						},
+					};
+				} catch (err) {
+					// Ensure cleanup on unexpected errors
+					clearCompletedExecutions();
+					throw err;
+				}
 			}
 
 			if (hasTasks && params.tasks) {
@@ -1513,41 +1720,52 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						isError: true,
 						details: { mode: "single" as const, results: [] },
 					};
-				const results = await mapConcurrent(params.tasks, MAX_CONCURRENCY, async (t, i) =>
-					runSync(ctx.cwd, agents, t.agent, t.task, {
-						cwd: t.cwd ?? params.cwd,
-						signal,
-						runId,
-						index: i,
-						sessionDir: sessionDirForIndex(i),
-						share: shareEnabled,
-						artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
-						artifactConfig,
-						authStorage,
-						modelRegistry,
-						maxOutput: params.maxOutput,
-						inheritMessages,
-						// Parallel mode doesn't track individual executions in overlay
-						mode: "parallel",
-					}),
-				);
+				const parallelTotal = params.tasks.length;
+				try {
+					const results = await mapConcurrent(params.tasks, MAX_CONCURRENCY, async (t, i) =>
+						runSync(ctx.cwd, agents, t.agent, t.task, {
+							cwd: t.cwd ?? params.cwd,
+							signal,
+							runId,
+							index: i,
+							sessionDir: sessionDirForIndex(i),
+							share: shareEnabled,
+							artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
+							artifactConfig,
+							authStorage,
+							modelRegistry,
+							maxOutput: params.maxOutput,
+							inheritMessages,
+							mode: "parallel",
+							parallelIndex: i,
+							parallelTotal,
+						}),
+					);
 
-				for (const r of results) {
-					if (r.progress) allProgress.push(r.progress);
-					if (r.artifactPaths) allArtifactPaths.push(r.artifactPaths);
+					// Clear all parallel executions after completion
+					clearCompletedExecutions();
+
+					for (const r of results) {
+						if (r.progress) allProgress.push(r.progress);
+						if (r.artifactPaths) allArtifactPaths.push(r.artifactPaths);
+					}
+
+					const ok = results.filter((r) => r.exitCode === 0).length;
+					const downgradeNote = parallelDowngraded ? " (async not supported for parallel)" : "";
+					return {
+						content: [{ type: "text", text: `${ok}/${results.length} succeeded${downgradeNote}` }],
+						details: {
+							mode: "parallel",
+							results,
+							progress: params.includeProgress ? allProgress : undefined,
+							artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
+						},
+					};
+				} catch (err) {
+					// Ensure cleanup on unexpected errors
+					clearCompletedExecutions();
+					throw err;
 				}
-
-				const ok = results.filter((r) => r.exitCode === 0).length;
-				const downgradeNote = parallelDowngraded ? " (async not supported for parallel)" : "";
-				return {
-					content: [{ type: "text", text: `${ok}/${results.length} succeeded${downgradeNote}` }],
-					details: {
-						mode: "parallel",
-						results,
-						progress: params.includeProgress ? allProgress : undefined,
-						artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
-					},
-				};
 			}
 
 			if (hasSingle) {
@@ -1821,6 +2039,24 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			} else if (hasRunning) {
 				// Fallback: we know something is running but can't find details
 				lines.push(theme.fg("dim", "(ctrl+shift+o for overlay)"));
+			} else if (ok < d.results.length) {
+				// Some steps failed - show error details
+				const failedResult = d.results.find((r) => r.exitCode !== 0);
+				if (failedResult) {
+					lines.push(theme.fg("error", `  Failed: ${failedResult.agent}`));
+					if (failedResult.error) {
+						const errPreview = failedResult.error.slice(0, 80) + (failedResult.error.length > 80 ? "..." : "");
+						lines.push(theme.fg("dim", `  ${errPreview}`));
+					}
+					// Show last output for context
+					const lastOutput = getFinalOutput(failedResult.messages);
+					if (lastOutput) {
+						const outputLines = lastOutput.split("\n").filter(l => l.trim()).slice(-2);
+						for (const line of outputLines) {
+							lines.push(theme.fg("dim", `  ${line.slice(0, 70)}${line.length > 70 ? "..." : ""}`));
+						}
+					}
+				}
 			}
 			return new Text(lines.join("\n"), 0, 0);
 		},
@@ -1979,7 +2215,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.registerShortcut("ctrl+shift+o", {
 		description: "Open subagent execution overlay",
 		async handler(ctx) {
-			if (!activeExecution) {
+			if (activeExecutions.size === 0) {
 				if (ctx.hasUI) {
 					ctx.ui.notify("No active subagent execution", "info");
 				}

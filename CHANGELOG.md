@@ -3,6 +3,42 @@
 ## [Unreleased]
 
 ### Added
+- **Multi-agent overlay support**: Parallel subagents now tracked in overlay with tab switching
+  - Tab/Shift+Tab to cycle between agents, 1-9 to select specific agent
+  - Each agent shows status icon (running/success/failed) in tab bar
+  - Scroll position resets when switching agents
+- **Subagent steering**: Can now send messages to running subagents via overlay input
+  - Press 'i' to enter input mode, type message, press Enter to send
+  - Uses SDK's `session.steer()` to inject messages into running session
+  - Proper error handling for both sync and async steer errors
+  - Shows `[steering not available yet]` if session still initializing
+
+### Changed
+- Overlay width reduced to max 100 columns (70% of terminal width) for better readability
+- Overlay output area capped at 20 lines to prevent excessive height
+- Tool/status line always shown for consistent overlay height (shows "Waiting..." or "Completed")
+- Scroll indicator section always present for consistent height
+
+### Fixed
+- **Overlay text overflow**: All content now properly truncated with `fitContent()` helper
+  - Header, task, tool, error, controls, input all use truncate-then-pad
+  - Prevents text from extending outside box borders
+- **Chain failure observability**: Collapsed view now shows error details when chains fail
+  - Shows which agent failed
+  - Shows error message preview (80 chars)
+  - Shows last 2 lines of output for context
+- **Chain/parallel cleanup**: Added try-catch wrappers to ensure `clearCompletedExecutions()` runs
+  - On success, failure, or unexpected exceptions
+  - Prevents stale execution state from lingering
+- **Overlay flickering**: Fixed by ensuring consistent height across all render states
+- Removed dead code: unused `getActiveExecution()` function
+- Fixed chain code indentation for readability
+
+---
+
+## Previous Changes
+
+### Added
 - **Context inheritance**: New `inheritContext` parameter allows subagents to inherit the parent session's conversation history
   - Subagent sees all prior messages from the parent session before executing its task
   - For chains, only the first step inherits context (subsequent steps use `{previous}`)
