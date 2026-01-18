@@ -220,7 +220,8 @@ function buildChainSummary(
 	const hasProgress = fs.existsSync(progressPath);
 
 	if (status === "completed") {
-		return `✅ Chain completed: ${stepNames} (${results.length} steps, ${durationStr})
+		const stepWord = results.length === 1 ? "step" : "steps";
+		return `✅ Chain completed: ${stepNames} (${results.length} ${stepWord}, ${durationStr})
 
 📋 Progress: ${hasProgress ? progressPath : "(none)"}
 📁 Artifacts: ${chainDir}`;
