@@ -119,6 +119,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 			renderWidget(lastUiContext, Array.from(asyncJobs.values()));
 		}, POLL_INTERVAL_MS);
+		poller.unref?.();
 	};
 
 	const handleResult = (file: string) => {
@@ -137,6 +138,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const watcher = fs.watch(RESULTS_DIR, (ev, file) => {
 		if (ev === "rename" && file?.toString().endsWith(".json")) setTimeout(() => handleResult(file.toString()), 50);
 	});
+	watcher.unref?.();
 	fs.readdirSync(RESULTS_DIR)
 		.filter((f) => f.endsWith(".json"))
 		.forEach(handleResult);
